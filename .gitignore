@@ -1,0 +1,7 @@
+MolSDP/*
+MolSDP.egg-info
+__pycache__/
+QM9/
+checkpoints/
+logs/
+*.png
