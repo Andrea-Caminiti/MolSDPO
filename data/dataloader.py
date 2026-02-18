@@ -4,9 +4,10 @@ from torch_geometric.datasets import QM9
 from torch.utils.data import DataLoader, Subset
 import lightning.pytorch as pl
 from tqdm import tqdm
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Set, Optional
 import os
 import pickle
+from rdkit import Chem
 
 
 class Collate_qm9:
@@ -382,4 +383,107 @@ if __name__ == '__main__':
         print(derivative)
         forces = -derivative
 
-    
+
+def load_qm9_smiles_from_dataset(dataset) -> Set[str]:
+    """
+    If you already have the torch_geometric QM9 dataset object in memory,
+    pass it here instead of re-reading from disk.
+
+    torch_geometric's QM9 dataset stores SMILES in data.smiles (a string
+    attribute added in recent versions). Falls back to re-parsing from
+    atomic numbers + positions if unavailable.
+
+    Args:
+        dataset : torch_geometric.datasets.QM9 instance (train split)
+
+    Returns:
+        Set of canonical SMILES strings.
+    """
+    smiles_set = set()
+    has_smiles_attr = hasattr(dataset[0], 'smiles')
+
+    if has_smiles_attr:
+        for data in dataset:
+            canonical = _canonicalise(data.smiles)
+            if canonical:
+                smiles_set.add(canonical)
+    else:
+        # Older torch_geometric versions don't store SMILES; parse from atoms
+        print("[load_qm9_smiles] No .smiles attribute found, parsing from atom types...")
+        for data in dataset:
+            mol = _data_to_mol(data)
+            if mol is not None:
+                try:
+                    smi = Chem.MolToSmiles(mol, isomericSmiles=True)
+                    if smi:
+                        smiles_set.add(smi)
+                except Exception:
+                    continue
+
+    print(f"[load_qm9_smiles] Loaded {len(smiles_set)} unique SMILES from dataset")
+    return smiles_set
+
+
+def _data_to_mol(data) -> Chem.Mol:
+    """Convert a torch_geometric QM9 Data object to an RDKit Mol."""
+    from rdkit.Chem import rdDetermineBonds
+    try:
+        # QM9 stores atomic numbers in data.z
+        zs  = data.z.tolist()
+        xyz = data.pos.numpy()
+
+        edit = Chem.RWMol()
+        conf = Chem.Conformer(len(zs))
+        for i, z in enumerate(zs):
+            idx = edit.AddAtom(Chem.Atom(int(z)))
+            conf.SetAtomPosition(idx, xyz[i].tolist())
+
+        mol = edit.GetMol()
+        mol.AddConformer(conf, assignId=True)
+        rdDetermineBonds.DetermineConnectivity(mol)
+        Chem.SanitizeMol(mol)
+        return mol
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _canonicalise(smi: str) -> str:
+    """Return canonical SMILES or empty string on failure."""
+    try:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return ''
+        return Chem.MolToSmiles(mol, isomericSmiles=True)
+    except Exception:
+        return ''
+
+
+# ---------------------------------------------------------------------------
+# Main entry point  (used in train.py)
+# ---------------------------------------------------------------------------
+
+def load_qm9_smiles(root: str = 'data/QM9', dataset=None) -> Set[str]:
+    """
+    Unified entry point. Prefer the dataset object if already in memory
+    (avoids re-reading disk), otherwise fall back to reading raw files.
+
+    Usage in LightningTabascoPipe.__init__:
+
+        from load_qm9_smiles import load_qm9_smiles
+
+        # If you have the dataset object from build_qm9_dataloader:
+        module, vocab_enc2atom, vocab_atom2enc = build_qm9_dataloader(...)
+        self.train_smiles = load_qm9_smiles(
+            root=args.data_root,
+            dataset=module.train_dataset   # or however you access it
+        )
+
+        # Or, if you just have the root path:
+        self.train_smiles = load_qm9_smiles(root=args.data_root)
+    """
+    if dataset is not None:
+        return load_qm9_smiles_from_dataset(dataset)

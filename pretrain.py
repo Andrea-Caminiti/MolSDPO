@@ -46,6 +46,7 @@ def pretrain(args):
                          max_steps=args.max_steps,
                          enable_progress_bar=True, 
                          logger=CSVLogger("logs", name="Pretrain"), 
+                         log_every_n_steps=920, 
                          callbacks=[checkpoint_callback, EMA],
                          gradient_clip_val=1.0, 
                          gradient_clip_algorithm="norm")

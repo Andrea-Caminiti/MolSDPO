@@ -1,132 +1,71 @@
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
+import os
 
-def ema(x, alpha=0.9):
-    """
-    x: 1D array-like
-    alpha: smoothing factor in [0,1), higher = smoother
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.zeros_like(x)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = alpha * y[i-1] + (1 - alpha) * x[i]
-    return y
-
-def mixed():
-    path1 = 'logs/TrainingSDPO/version_7'
-    path2 = 'logs/TrainingSDPO/version_8'
-    df1 = pd.read_csv(path1+'/metrics.csv')
-    df2 = pd.read_csv(path2+'/metrics.csv')
-    df2['step'] = df1['step'].max() + df2['step']
-    df = pd.concat([df1, df2])
-    print(df['step'].max())
-    dest_path = './'
-
-    loss = df[['epoch', 'Training_loss']].dropna().groupby('epoch').mean()
-    fig, ax = plt.subplots()
-    plt.plot(df['epoch'].unique(), loss, label='Training Loss')
-    plt.legend()
-    ax.tick_params('x', rotation=90)
-    plt.title('Losses per epoch')
-    plt.savefig(dest_path+'Loss_epoch.png')
+def plot_rl_metrics(csv_path):
+    # Load data - handles empty cells as NaN
+    df = pd.read_csv(csv_path)
     
-    plt.show()
+    
+    outpath = csv_path.replace(os.path.basename(csv_path), "")
+    # Define groups for general plotting
+    groups = {
+        'rewards_1': ['Rewards_1_start', 'Rewards_1_anchor', 'Rewards_1_last'],
+        'rewards_2': ['Rewards_2_start', 'Rewards_2_anchor', 'Rewards_2_last'],
+        'reward_stats': ['Reward0_mean', 'Reward_gap_start', 'Reward_gap_last'],
+        'training_stats': ['Training_loss', 'log_diff', 'advantage_diff']
+    }
 
-    df['step'] = df['step'] // 100
-    df_filtered = df[['step', 'Training_loss']].dropna().groupby('step').mean()
-    plt.plot(df_filtered, label='Training Loss')
-    plt.plot(ema(df_filtered), label='Smoothed Training Loss')
-    plt.legend()
-    plt.title('Losses per step')
-    plt.savefig(dest_path+'Loss_step.png')
-    plt.show()
+    # 1. Standard Plots for other metrics
+    for name, cols in groups.items():
+        plt.figure(figsize=(10, 5))
+        for col in cols:
+            if col in df.columns:
+                valid_df = df.dropna(subset=[col, 'step'])
+                plt.plot(valid_df['step'], valid_df[col], label=col, alpha=0.8)
+        plt.title(name.replace('_', ' ').title())
+        plt.xlabel('Step')
+        plt.ylabel('Value')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.4)
+        plt.tight_layout()
+        plt.savefig(f'{outpath}/{name}.png')
+        plt.close()
 
-    step0 = df[['step', "Rewards_1_start"]].dropna().groupby('step').mean()["Rewards_1_start"] - df[['step',"Rewards_2_start"]].dropna().groupby('step').mean()["Rewards_2_start"]
-    plt.plot(step0, label='step0')
-    anchor = df[['step', "Rewards_1_anchor"]].dropna().groupby('step').mean()["Rewards_1_anchor"] - df[['step',"Rewards_2_anchor"]].dropna().groupby('step').mean()["Rewards_2_anchor"]
-    plt.plot(anchor, label='anchor')
-    last = df[['step',"Rewards_1_last"]].dropna().groupby('step').mean()["Rewards_1_last"] - df[['step',"Rewards_2_last"]].dropna().groupby('step').mean()["Rewards_2_last"]
-    plt.plot(last, label='last step')
-    plt.legend()
-    plt.title('Reward gaps')
-    plt.show()
+    # 2. SPECIAL PLOT: Correlation with Smoothed Trend Line
+    if 'log_adv_corr' in df.columns:
+        plt.figure(figsize=(12, 6))
+        
+        # Drop missing values to ensure the rolling calculation is continuous
+        corr_df = df.dropna(subset=['log_adv_corr', 'step']).copy()
+        
+        # Plot RAW data in the background (faint gray with markers)
+        plt.plot(corr_df['step'], corr_df['log_adv_corr'], 
+                 color='gray', alpha=0.3, label='Raw Correlation',
+                 marker='o', markersize=3, linestyle='-')
+        
+        # Calculate Smoothed Line (Rolling Mean)
+        # Change window=15 to a larger number (e.g., 50) for more aggressive smoothing
+        corr_df['smoothed'] = corr_df['log_adv_corr'].rolling(window=15, min_periods=1, center=True).mean()
+        
+        # Plot SMOOTHED line in the foreground (bold red)
+        plt.plot(corr_df['step'], corr_df['smoothed'], 
+                 color='red', linewidth=2.5, label='Smoothed Trend (Rolling Mean)')
+        
+        plt.title('Log-Advantage Correlation: Raw vs. Trend', fontsize=14)
+        plt.xlabel('Step')
+        plt.ylabel('Correlation Coefficient')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.4)
+        plt.tight_layout()
+        plt.savefig(f'{outpath}/correlation_smoothed.png')
+        print("Generated 'correlation_smoothed.png' with trend line.")
+        plt.close()
 
-    plt.plot(ema(step0), label='step0')
-    plt.plot(ema(anchor), label='anchor')  
-    plt.plot(ema(last), label='last step')
-    plt.title('Reward gaps smooth')
-    plt.legend()
-    plt.savefig(dest_path+'Reward gaps smooth.png')
-    plt.show()
+if __name__ == "__main__":
+    file_name = 'logs/TrainingSDPO/version_0/metrics.csv' # Ensure this matches your filename
+    if os.path.exists(file_name):
+        plot_rl_metrics(file_name)
+    else:
+        print(f"File '{file_name}' not found.")
 
-    corr = df[['step',"corr"]].dropna().groupby('step').mean()
-    plt.plot(corr, label='raw')
-    plt.plot(ema(corr), label='smooth')
-    plt.legend()
-    plt.title('Advantage - log_diff correlation')
-    plt.savefig(dest_path+'Advantage - log_diff correlation.png')
-    plt.show()
-
-    corr_cols = ['corr_late_refine', 'corr_mid_structure', 'corr_early_noise']
-    df['step'] //= 10
-    df_filtered = df[['step'] + corr_cols].dropna().groupby('step').mean()
-
-    plt.figure(figsize=(10, 6))
-    sns.heatmap(df_filtered.T, annot=True, cmap='RdYlGn', center=0)
-    plt.title("Correlation Heatmap: Training Progress vs. Diffusion Phase")
-    plt.xlabel("Step")
-    plt.ylabel("Diffusion Phase")
-    plt.savefig(dest_path+"Correlation Heatmap: Training Progress vs. Diffusion Phase.png")
-    plt.show()
-
-def normal():
-    path = 'logs/TrainingSDPO/version_32'
-    df = pd.read_csv(path+'/metrics.csv')
-
-    dest_path = 'logs/TrainingSDPO/version_'+path[path.index('_') +1:]+'/'
-
-    plt.plot(df['Training_loss'], label='Training Loss')
-    plt.plot(ema(df['Training_loss']), label='Smoothed Training Loss')
-    plt.legend()
-    plt.title('Losses per step')
-    plt.savefig(dest_path+'Loss_step.png')
-    plt.show()
-
-    step0 = df[['step', "Rewards_1_start"]].dropna().groupby('step').mean()["Rewards_1_start"] - df[['step',"Rewards_2_start"]].dropna().groupby('step').mean()["Rewards_2_start"]
-    plt.plot(step0, label='step0')
-    anchor = df[['step', "Rewards_1_anchor"]].dropna().groupby('step').mean()["Rewards_1_anchor"] - df[['step',"Rewards_2_anchor"]].dropna().groupby('step').mean()["Rewards_2_anchor"]
-    plt.plot(anchor, label='anchor')
-    last = df[['step',"Rewards_1_last"]].dropna().groupby('step').mean()["Rewards_1_last"] - df[['step',"Rewards_2_last"]].dropna().groupby('step').mean()["Rewards_2_last"]
-    plt.plot(last, label='last step')
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.legend()
-    plt.title('Reward gaps')
-    plt.show()
-
-    plt.plot(ema(step0), label='step0')
-    plt.plot(ema(anchor), label='anchor')  
-    plt.plot(ema(last), label='last step')
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.title('Reward gaps smooth')
-    plt.legend()
-    plt.savefig(dest_path+'Reward gaps smooth.png')
-    plt.show()
-
-    plt.plot(df['log_diff'], label='log_diff')
-    plt.plot(df['advantage_diff'], label='Adv_diff')
-    plt.title('Log_diff - Adv_diff')
-    plt.legend()
-    plt.savefig(dest_path+'Log_diff - Adv_diff.png')
-    plt.show()
-
-    plt.scatter(df['advantage_diff'], df['log_diff'])
-    plt.title('Log_diff - Adv_diff')
-    plt.axhline()
-    plt.axvline()
-    plt.savefig(dest_path+'Scatter.png')
-    plt.show()
-
-if __name__ == '__main__':
-    normal()

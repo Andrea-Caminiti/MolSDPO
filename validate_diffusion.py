@@ -148,7 +148,7 @@ class DiffusionValidator:
                 atom_types = atom_types.to(self.device)
                 
                 # Use DDIM to denoise
-                reconstructed = self._ddim_reconstruct(coords, atom_types, num_steps=50)
+                reconstructed = self._ddim_reconstruct(coords, atom_types, num_steps=25)
                 
                 # Compute error
                 error_coord = F.mse_loss(reconstructed[0], coords)
@@ -184,7 +184,7 @@ class DiffusionValidator:
                 atom_types = torch.randn(10, 29, 6, device=self.device)
                 
                 # DDIM sampling
-                samples_batch = self._ddim_sample(coords, atom_types, num_steps=50)
+                samples_batch = self._ddim_sample(coords, atom_types, num_steps=25)
                 samples.extend(samples_batch)
         
         # Analyze samples
@@ -284,7 +284,7 @@ class DiffusionValidator:
                 coords = torch.randn(10, 29, 3, device=self.device)
                 atom_types = torch.randn(10, 29, 6, device=self.device)
                 
-                samples_batch = self._ddim_sample(coords, atom_types, num_steps=50)
+                samples_batch = self._ddim_sample(coords, atom_types, num_steps=25)
                 samples.extend(samples_batch)
         
         # Compute pairwise distances
@@ -331,7 +331,7 @@ class DiffusionValidator:
                 coords = torch.randn(10, 29, 3, device=self.device)
                 atom_types = torch.randn(10, 29, 6, device=self.device)
                 
-                samples_batch = self._ddim_sample(coords, atom_types, num_steps=50)
+                samples_batch = self._ddim_sample(coords, atom_types, num_steps=25)
                 samples.extend(samples_batch)
         
         # Convert to RDKit molecules
@@ -405,7 +405,7 @@ class DiffusionValidator:
                 coords = torch.randn(10, 29, 3, device=self.device)
                 atom_types = torch.randn(10, 29, 6, device=self.device)
                 
-                samples_batch = self._ddim_sample(coords, atom_types, num_steps=50)
+                samples_batch = self._ddim_sample(coords, atom_types, num_steps=25)
                 samples.extend(samples_batch)
         
         gen_stats = self._compute_sample_stats(samples)
@@ -430,7 +430,7 @@ class DiffusionValidator:
     
     # ==================== Helper Methods ====================
     
-    def _ddim_sample(self, coords, atom_types, num_steps=50):
+    def _ddim_sample(self, coords, atom_types, num_steps=25):
         """Generate samples using DDIM."""
         self.scheduler.set_timesteps(num_steps, device=self.device)
         
@@ -464,15 +464,9 @@ class DiffusionValidator:
                 samples.append((coords[i][mask].cpu() * 2.2, atom_nums[mask].cpu()))
             else:
                 samples.append(None)
-        c = coords[0][mask].cpu()  # First molecule, valid atoms only
-        dists = torch.cdist(c.unsqueeze(0), c.unsqueeze(0))[0]
-        dists = dists[dists > 0]
-        print(f"Generated coords range: [{c.min():.3f}, {c.max():.3f}]")
-        print(f"Generated min pairwise dist: {dists.min():.3f}")
-        print(f"Generated mean pairwise dist: {dists.mean():.3f}")
         return samples
     
-    def _ddim_reconstruct(self, coords, atom_types, num_steps=50):
+    def _ddim_reconstruct(self, coords, atom_types, num_steps=25):
         """Reconstruct from slightly noised sample."""
         # Add small noise
         t = 50
@@ -564,9 +558,6 @@ class DiffusionValidator:
             c = c_raw[mask]
             dists = torch.cdist(c.unsqueeze(0), c.unsqueeze(0))[0]
             dists = dists[dists > 0]
-            print(f"Real coords range (dataloader): [{c.min():.3f}, {c.max():.3f}]")
-            print(f"Real min pairwise dist: {dists.min():.3f}")
-            print(f"Real mean pairwise dist: {dists.mean():.3f}")
             
             for i in range(coords.shape[0]):
                 atom_indices = atom_types[i].argmax(dim=-1)
@@ -700,7 +691,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     module, vocab_enc2atom, vocab_atom2enc = build_qm9_dataloader(root=args.data_root, batch_size=args.batch_size, num_workers=args.num_workers)
     ABSORB_IDX = len(vocab_enc2atom)
-    checkpoint = torch.load('checkpoints/Pretrain.ckpt')['state_dict']
+    checkpoint = torch.load('logs/TrainingSDPO/ckpts/epoch=0-step=11600-Reward0_mean=-1.9925.ckpt')['state_dict']
     #checkpoint = {k[6:]: v for k,v in checkpoint.items()}
     checkpoint = {k[7 + k[6:].index('.'):]: v for k,v in checkpoint.items() if 'model' in k}
     tabasco = TabascoV2(atom_vocab_size=ABSORB_IDX, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, pos_coord_dim=128, pair_rbf_centers=args.d_model//2, dropout=0.1)

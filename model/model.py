@@ -6,13 +6,15 @@ import lightning.pytorch as pl
 from typing import Optional
 from model.util import TimeEmbed
 from model.RBF import PairwiseRBF
-from model.loss import p_losses_joint_absorb
+from model.loss import p_losses_joint_absorb_improved_efficient
 from model.scheduler import precompute_schedule, cosine_beta_schedule
 from model.util import cosine_warmup_lr
 from diffusers import DDIMScheduler
 from config import DDIM_config
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import rdDetermineBonds, Descriptors
+
+RDLogger.DisableLog('rdApp.*')  
 
 
 # ---------- Small helpers ----------
@@ -448,7 +450,7 @@ class LightningTabasco(pl.LightningModule):
         ).to(self.device)
         
         # Compute loss
-        loss, coord_loss, atom_loss, dist_loss, noises = p_losses_joint_absorb(
+        loss, metrics = p_losses_joint_absorb_improved_efficient(
             self.model, coords, atom_types, t, 
             self.scheduler, self.device, lambda_type=1.0
         )
@@ -459,9 +461,6 @@ class LightningTabasco(pl.LightningModule):
         
         # Weighted losses
         loss_weighted = (loss * weights).mean()
-        coord_loss_weighted = (coord_loss * weights).mean()
-        atom_loss_weighted = (atom_loss * weights).mean()
-        dist_loss_weighted = (dist_loss * weights).mean()
         
         # Update loss history
         self.update_loss_history(t.squeeze(), loss.detach())
@@ -469,10 +468,7 @@ class LightningTabasco(pl.LightningModule):
         # Logging
         self.log_dict({
             'loss': loss_weighted,
-            'coord_loss': coord_loss_weighted,
-            'atom_loss': atom_loss_weighted,
-            'dist_loss': dist_loss_weighted,
-            **noises
+            **metrics
         }, on_step=True, prog_bar=False)
         
         return loss_weighted
