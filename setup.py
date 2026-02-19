@@ -19,6 +19,6 @@ setup(
         "rdkit==2024.09.4",
         "openbabel-wheel",
         "lightning==2.0.3",
-        "torchani",
+        "diffusers",
     ]
     )
