@@ -8,7 +8,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from model.model import TabascoV2
 from data.dataloader import build_qm9_dataloader, load_qm9_smiles
 from RL.SDPO import pipeline_with_logprob, ddim_step_with_logprob, categorical_reverse_step, recompute_log_probs
-from RL.rewards import get_reward, GeometricReward
+from RL.energy_rewards import get_reward, EnergyRewarder
 from RL.validation import ValidationMixin
 from rdkit import RDLogger, Chem      
 from diffusers import DDIMScheduler 
@@ -54,17 +54,23 @@ def train(args):
     early_stop = EarlyStopping(
                             monitor='val/stopping_score',
                             mode='max',
-                            patience=20,       # 20 validation epochs without improvement
+                            patience=8,
                             min_delta=0.001,
                         )
     torch.set_float32_matmul_precision('high')
     trainer = pl.Trainer(
-        accelerator='gpu', devices=1, precision='32',
+        accelerator='gpu', devices=1,
+        # OPTIMIZATION: bf16-mixed uses BF16 for forward/backward but keeps
+        # master weights in FP32.  BF16 has the same dynamic range as FP32
+        # (unlike FP16) so training stability is maintained.  Combined with
+        # FlashAttention in model.py this typically gives 30-50% wall-clock
+        # speedup on Ampere/Hopper GPUs with no accuracy regression.
+        precision='bf16-mixed',
         max_steps=args.max_steps,
         enable_progress_bar=True,
         logger=CSVLogger("logs", name="TrainingSDPO", flush_logs_every_n_steps=1),
         log_every_n_steps=1,
-        val_check_interval=300,    # validate every 300 training steps
+        val_check_interval=300,
         callbacks=[checkpoint_callback, early_stop],
     )
     module, vocab_enc2atom, vocab_atom2enc = build_qm9_dataloader(
@@ -73,7 +79,7 @@ def train(args):
     module.setup()
     train_dset = load_qm9_smiles(dataset=module.train_dataset)
     ABSORB_IDX = len(vocab_enc2atom)
-    checkpoint = torch.load('checkpoints/Pretrain.ckpt')['state_dict']
+    checkpoint = torch.load('checkpoints/Pretrain_fast.ckpt')['state_dict']
     checkpoint = {k[7 + k[6:].index('.'):]: v for k, v in checkpoint.items() if 'model' in k}
     tabasco = TabascoV2(
         atom_vocab_size=ABSORB_IDX, d_model=args.d_model, n_heads=args.n_heads,
@@ -82,7 +88,7 @@ def train(args):
     )
     tabasco.load_state_dict(checkpoint)
     tabasco = torch.compile(tabasco)
-    rewarder = GeometricReward()
+    rewarder = EnergyRewarder(batch_size=self.args.batch_size)
     args.vdW = vdW()
     model = LightningTabascoPipe(tabasco, rewarder, args, ABSORB_IDX, vocab_enc2atom, train_dset)
     trainer.fit(model=model, datamodule=module)
@@ -91,7 +97,7 @@ def train(args):
 class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
     def __init__(self, tabasco: TabascoV2, rewarder, args, ABSORB_IDX: int, vocab: Dict, train_dset):
         super().__init__()
-        self.train_smiles  = set(train_dset)  # canonical SMILES from training split
+        self.train_smiles  = set(train_dset)
         self.val_n_samples = 256   
         self.automatic_optimization = False
 
@@ -107,14 +113,11 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
 
         self.adv_normalizer = RunningStats()
 
-        # PPO standard; the old 1e-4 effectively zeroed every clipped gradient.
         self.clip_range   = 0.2
-        # Loose clip; normalization already controls scale.
-        # The old 1e-2 crushed adv_diff to near-zero, killing the target signal.
         self.adv_clip_max = 1.0
 
         self.eta              = 1.0
-        self.advantage_scale  = 10.0
+        self.advantage_scale  = 0.3
         self.rewarder         = rewarder
         self.vocab            = self.vocab.to(args.device)
 
@@ -209,23 +212,29 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             timesteps_BT = timesteps_1d.unsqueeze(0).expand(B, -1)     # [B, T]
 
             # ── Phase 2: frozen old log_probs ────────────────────────────
-            # One forward pass with the current (pre-update) model.
-            # These are then held constant for all K inner steps so that
-            # the ratio log_prob_new/log_prob_old measures actual policy change.
-            lp_coord1_old, lp_types1_old = recompute_log_probs(
-                self.model, self.scheduler, coords1, atoms1, eta=self.eta
+            # OPTIMIZATION: concatenate both trajectories along the batch dim
+            # so a single forward pass replaces two separate calls.
+            # This halves the number of frozen forward passes per training step.
+            coords_cat = torch.cat([coords1, coords2], dim=0)   # [2B, T+1, N, 3]
+            atoms_cat  = torch.cat([atoms1,  atoms2],  dim=0)   # [2B, T+1, N, A]
+            lp_coord_old, lp_types_old = recompute_log_probs(
+                self.model, self.scheduler, coords_cat, atoms_cat, eta=self.eta
             )
-            lp_coord2_old, lp_types2_old = recompute_log_probs(
-                self.model, self.scheduler, coords2, atoms2, eta=self.eta
-            )
+            lp_coord1_old, lp_coord2_old = lp_coord_old.chunk(2, dim=0)
+            lp_types1_old, lp_types2_old = lp_types_old.chunk(2, dim=0)
             lp_coord1_old = lp_coord1_old.detach()
             lp_types1_old = lp_types1_old.detach()
             lp_coord2_old = lp_coord2_old.detach()
             lp_types2_old = lp_types2_old.detach()
 
+            if self.global_step % 500 == 0 and self.args.debug:
+                get_reward(mols1, self.rewarder, self.vocab, self.args.vdW, debug=True)
+
             # ── Rewards ──────────────────────────────────────────────────
-            rewards1 = get_reward(mols1, self.rewarder, self.vocab, self.args.vdW).T
-            rewards2 = get_reward(mols2, self.rewarder, self.vocab, self.args.vdW).T
+            progress = min(self.global_step / 5000.0, 1.0)
+            w_quality_curr = 0.5 + 1.5 * progress
+            rewards1 = get_reward(mols1, self.rewarder, self.vocab, self.args.vdW, w_quality=w_quality_curr).T
+            rewards2 = get_reward(mols2, self.rewarder, self.vocab, self.args.vdW, w_quality=w_quality_curr).T
 
             self.log('Rewards_1_start',  rewards1[:, 2].mean())
             self.log('Rewards_1_anchor', rewards1[:, 1].mean())
@@ -235,7 +244,6 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             self.log('Rewards_2_last',   rewards2[:, 0].mean())
             self.log('Reward0_mean',
                      (rewards1[:, 2].mean() + rewards2[:, 2].mean()) / 2, on_step=True)
-            # Log reward gaps so we can see if the reward function is discriminating
             self.log('Reward_gap_start', (rewards1[:, 2] - rewards2[:, 2]).abs().mean())
             self.log('Reward_gap_last',  (rewards1[:, 0] - rewards2[:, 0]).abs().mean())
 
@@ -274,11 +282,6 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
         timesteps_2BT = timesteps_BT.repeat(2, 1)
 
         # ── Phase 3: inner update loop ───────────────────────────────────
-        # At inner step k=0 the model weights are identical to the rollout
-        # model, so log_diff ≈ 0 — but the gradient of log_diff wrt θ is
-        # nonzero (it equals d log_prob_new/dθ), so the model starts moving.
-        # By k=1 the weights have changed and log_diff is genuinely nonzero.
-        # This is why inner_epochs > 1 is important (default: 4).
         self.model.train()
         log_diff_last = None
         adv_diff_last = None
@@ -334,13 +337,8 @@ if __name__ == '__main__':
     parser.add_argument('--dataset',       default='qm9')
     parser.add_argument('--data-root',     default='data/QM9')
     parser.add_argument('--max_steps',     type=int,   default=200_000)
-    # inner_epochs > 1 is the key fix: model weights change between steps so
-    # log_prob_new diverges from log_prob_old, making log_diff nonzero.
-    # Start at 4; if log_diff is still near 0, try 8.
     parser.add_argument('--inner_epochs',  type=int,   default=8)
-    parser.add_argument('--batch-size',    type=int,   default=16)
-    # Lower LR than before: inner loop amplifies updates, so per-step LR
-    # should be smaller to avoid overshooting.
+    parser.add_argument('--batch-size',    type=int,   default=56)
     parser.add_argument('--lr',            type=float, default=1e-4)
     parser.add_argument('--log_scale',     type=float, default=1.0)
     parser.add_argument('--gamma',         type=float, default=0.99)

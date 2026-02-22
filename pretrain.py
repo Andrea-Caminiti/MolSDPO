@@ -39,17 +39,23 @@ def pretrain(args):
 
     checkpoint_callback = ModelCheckpoint(dirpath="logs/Pretrain/ckpts/", save_top_k=5, monitor="val/denoise_loss_t100", mode='min', filename='{epoch}-{step}-{loss:.2f}')
     EMA = StochasticWeightAveraging(1e-3, avg_fn=ema_avg_fn)
-
+    early_stop = EarlyStopping(
+                            monitor='val/denoise_loss_t100',
+                            mode='max',
+                            patience=8,
+                            min_delta=0.001,
+                        )
     trainer = pl.Trainer(accelerator='gpu', 
                          devices=1, 
-                         precision="16-mixed", 
+                         precision="bf16-mixed", 
                          max_steps=args.max_steps,
                          enable_progress_bar=True, 
                          logger=CSVLogger("logs", name="Pretrain"), 
                          log_every_n_steps=920, 
                          callbacks=[checkpoint_callback, EMA],
                          gradient_clip_val=1.0, 
-                         gradient_clip_algorithm="norm")
+                         gradient_clip_algorithm="norm",
+                         val_check_interval=920)
     
     
     model = LightningTabasco(args, vocab_enc2atom)  # ← was just (args)

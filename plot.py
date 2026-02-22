@@ -76,7 +76,7 @@ def plot_training_metrics(csv_path):
 
 if __name__ == "__main__":
     # Path to your CSV file
-    csv_file = 'logs/Pretrain/version_6/metrics.csv'
+    csv_file = 'logs/Pretrain/version_0/metrics.csv'
     
     if os.path.exists(csv_file):
         plot_training_metrics(csv_file)

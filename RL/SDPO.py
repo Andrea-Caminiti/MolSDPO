@@ -15,10 +15,14 @@ def _gather_alphas(alphas_cumprod, t):
     """
     Gather from a 1-D alphas_cumprod using an index tensor `t` of any shape.
     Returns a tensor with the same shape as `t`.
+
+    OPTIMIZATION: moved alphas to t.device here rather than calling .cpu() on t,
+    which was causing a GPU→CPU sync on every single call (hundreds of times per
+    training step).  alphas_cumprod is small (1000 floats) so the one-time .to()
+    is essentially free, and no CPU round-trip occurs.
     """
-    orig_shape = t.shape
-    result = alphas_cumprod.gather(0, t.cpu().flatten()).reshape(orig_shape)
-    return result
+    alphas = alphas_cumprod.to(t.device)
+    return alphas.gather(0, t.flatten()).reshape(t.shape)
 
 
 def _get_variance(self, timestep, prev_timestep):
@@ -142,10 +146,11 @@ def recompute_log_probs(
 ):
     """
     Re-evaluates log P(x_{t-1} | x_t, model) for every transition in a stored
-    trajectory using a BATCHED forward pass.  This makes old log_probs
-    model-dependent (using the frozen model at rollout time) rather than
-    pinned to the noise magnitude, which is what enables the log-ratio to
-    correlate with advantages.
+    trajectory using a BATCHED forward pass.
+
+    OPTIMIZATION NOTE: callers in train.py should pass both trajectories
+    concatenated along dim=0 (doubling B) so a single call replaces two
+    separate calls — halving the number of frozen forward passes per step.
 
     Args:
         coords_traj:  [B, T+1, N, 3]
@@ -180,6 +185,38 @@ def recompute_log_probs(
     return log_prob_coord, log_prob_atoms   # both [B, T]
 
 
+def _bimodal_cosine_sim(
+    all_clean: torch.Tensor,        # [B, T, N, D_coord + D_atom]
+    reference: torch.Tensor,        # [B, T, N, D_coord + D_atom]  (already expanded)
+    coord_dim: int = 3,
+    coord_weight: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute cosine similarity between all_clean and reference with the two
+    modalities (coords and atom types) handled separately and then combined.
+    """
+    atom_weight = 1.0 - coord_weight
+
+    coords     = all_clean[..., :coord_dim]
+    atoms      = all_clean[..., coord_dim:]
+    ref_coords = reference[..., :coord_dim]
+    ref_atoms  = reference[..., coord_dim:]
+
+    coords     = F.normalize(coords,     dim=-1, eps=1e-8)
+    ref_coords = F.normalize(ref_coords, dim=-1, eps=1e-8)
+    atoms      = F.normalize(atoms,      dim=-1, eps=1e-8)
+    ref_atoms  = F.normalize(ref_atoms,  dim=-1, eps=1e-8)
+
+    sim_coord = torch.cosine_similarity(
+        coords.flatten(2, 3), ref_coords.flatten(2, 3), dim=2
+    )   # [B, T]
+    sim_atom = torch.cosine_similarity(
+        atoms.flatten(2, 3), ref_atoms.flatten(2, 3), dim=2
+    )   # [B, T]
+
+    return coord_weight * sim_coord + atom_weight * sim_atom
+
+
 def pipeline_with_logprob(
     self: TabascoV2,
     x, types,
@@ -188,7 +225,9 @@ def pipeline_with_logprob(
     B: int = 32,
     N: int = 29,
     num_inference_steps: int = 50,
-    eta=0.2
+    eta=0.2,
+    coord_weight: float = 0.5,
+    coord_dim: int = 3,
 ):
     all_clean = []
     all_clean_t = []
@@ -206,8 +245,6 @@ def pipeline_with_logprob(
 
         all_mols.append((x, types))
         all_clean.append(torch.cat((clean, clean_t), -1))
-        # log_probs stored here are ONLY used as a fallback; the training step
-        # should call recompute_log_probs() for model-dependent old log_probs.
         all_log_probs.append(torch.cat((log_prob_coord.unsqueeze(-1), log_prob_type.unsqueeze(-1)), -1))
 
         if i == 0 or i == num_inference_steps - 1:
@@ -216,25 +253,33 @@ def pipeline_with_logprob(
             y_hard = torch.scatter(y_hard, -1, clean_t.argmax(dim=-1, keepdim=True), 1.0)
             mols.append([clean, y_hard])
 
-    all_clean = torch.stack(all_clean, dim=1)
+    all_clean = torch.stack(all_clean, dim=1)   # [B, T, N, D]
 
-    sim_first = torch.cosine_similarity(
-        all_clean.flatten(2, 3),
-        all_clean[:, 0:1].repeat(1, num_inference_steps, 1, 1).flatten(2, 3), dim=2
+    # --- Bimodal anchor selection -------------------------------------------
+    first_expanded  = all_clean[:, 0:1].expand_as(all_clean)
+    last_expanded   = all_clean[:, -1:].expand_as(all_clean)
+
+    sim_first = _bimodal_cosine_sim(
+        all_clean, first_expanded,
+        coord_dim=coord_dim, coord_weight=coord_weight
     )
-    sim_last = torch.cosine_similarity(
-        all_clean.flatten(2, 3),
-        all_clean[:, -1:].repeat(1, num_inference_steps, 1, 1).flatten(2, 3), dim=2
+    sim_last = _bimodal_cosine_sim(
+        all_clean, last_expanded,
+        coord_dim=coord_dim, coord_weight=coord_weight
     )
 
-    divergence = sim_first + sim_last
+    divergence  = sim_first + sim_last
     anchor_steps = torch.argmin(divergence, dim=1)
-    ori_latents_anchor = all_clean[torch.arange(len(anchor_steps), device=device), anchor_steps]
+    ori_latents_anchor = all_clean[
+        torch.arange(len(anchor_steps), device=device), anchor_steps
+    ]
 
-    sim_anchor = torch.cosine_similarity(
-        all_clean.flatten(2, 3),
-        ori_latents_anchor.unsqueeze(1).repeat(1, num_inference_steps, 1, 1).flatten(2, 3), dim=2
+    anchor_expanded = ori_latents_anchor.unsqueeze(1).expand_as(all_clean)
+    sim_anchor = _bimodal_cosine_sim(
+        all_clean, anchor_expanded,
+        coord_dim=coord_dim, coord_weight=coord_weight
     )
+    # ------------------------------------------------------------------------
     c, a = torch.split(ori_latents_anchor, [3, 6], dim=-1)
     ori_latents_a = F.softmax(a, dim=-1)
     y_hard = torch.zeros_like(ori_latents_a)

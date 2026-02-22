@@ -178,7 +178,7 @@ class DiffusionValidator:
         samples = []
         
         with torch.no_grad():
-            for _ in tqdm(range(num_samples // 10), desc="  Generating"):
+            for _ in range(num_samples // 10):
                 # Start from noise
                 coords = torch.randn(10, 29, 3, device=self.device)
                 atom_types = torch.randn(10, 29, 6, device=self.device)
