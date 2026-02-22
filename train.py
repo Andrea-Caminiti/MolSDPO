@@ -88,7 +88,7 @@ def train(args):
     )
     tabasco.load_state_dict(checkpoint)
     tabasco = torch.compile(tabasco)
-    rewarder = EnergyRewarder(batch_size=self.args.batch_size)
+    rewarder = EnergyRewarder(batch_size=args.batch_size)
     args.vdW = vdW()
     model = LightningTabascoPipe(tabasco, rewarder, args, ABSORB_IDX, vocab_enc2atom, train_dset)
     trainer.fit(model=model, datamodule=module)
