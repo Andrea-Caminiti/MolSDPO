@@ -8,19 +8,16 @@ def plot_training_metrics(csv_path):
     df = pd.read_csv(csv_path)
     outpath = csv_path.replace(os.path.basename(csv_path), "")
     # 2. Define metric groups for better organization
-    train_losses = [
-        'loss', 'coord_loss', 'type_loss', 'dist_loss', 
-        'geom_loss', 'com_loss', 'mag_loss'
-    ]
+    train_losses = ["com_loss","coord_loss","geom_loss","loss","mag_loss","type_loss"]
     val_denoise = [
         'val/denoise_loss_t10', 'val/denoise_loss_t100', 
         'val/denoise_loss_t500', 'val/denoise_loss_t900'
     ]
     val_ratios = [
-        'val/valid_ratio', 'val/connected_ratio', 'val/realistic_ratio'
+        'val/valid_ratio', 'val/connected_ratio', 'val/realistic_ratio', 
     ]
     val_stats = ['val/mean_atoms', 'val/mean_min_dist_A']
-
+    val_frags = ['val/mean_number_frags']
     # Helper function to plot a group of metrics
     def plot_group(cols, title, ylabel, filename, marker=None):
         plt.figure(figsize=(12, 6))
@@ -49,6 +46,8 @@ def plot_training_metrics(csv_path):
 
     # Plot Validation Quality Ratios
     plot_group(val_ratios, 'Validation Quality Ratios', 'Ratio (0-1)', f'{outpath}/val_ratios.png', marker='s')
+    
+    plot_group(val_frags, 'Validation Number of Fragments', 'Number of fragments', f'{outpath}/val_frags.png', marker='s')
 
     # Plot Mixed Validation Stats (Double Y-Axis)
     if all(col in df.columns for col in val_stats):
@@ -76,7 +75,7 @@ def plot_training_metrics(csv_path):
 
 if __name__ == "__main__":
     # Path to your CSV file
-    csv_file = 'logs/Pretrain/version_0/metrics.csv'
+    csv_file = 'logs/Pretrain/version_1/metrics.csv'
     
     if os.path.exists(csv_file):
         plot_training_metrics(csv_file)

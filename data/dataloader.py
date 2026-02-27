@@ -24,34 +24,44 @@ class Collate_qm9:
 
     def __call__(self, batch):
         """
-        Collate batch of molecules with padding.
-        
+        Collate batch of molecules with padding and COM centering.
+
+        Each molecule is centred at its centre of mass (computed over real
+        atoms only) before being placed in the output tensor.  Padding
+        positions remain at zero, which is now consistent with a centred
+        molecule since the COM of real atoms is exactly the origin.
+
         Returns:
-            coords: [B, max_N, 3] padded coordinates
+            coords:     [B, max_N, 3] padded, COM-centred coordinates
             atom_types: [B, max_N, vocab_size] padded one-hot atom types
         """
         B = len(batch)
         max_N = self.max_N
-        
-        # Pre-allocate tensors for efficiency
-        coords = torch.zeros(B, max_N, 3, dtype=torch.float32)
+
+        # Pre-allocate tensors (zeros = padding sentinel)
+        coords     = torch.zeros(B, max_N, 3, dtype=torch.float32)
         atom_types = torch.zeros(B, max_N, dtype=torch.long)
-        
+
         for i, d in enumerate(batch):
-            pos = d.pos     # [N, 3]
-            z = d.z         # [N] atomic numbers
-            N = pos.size(0)
-            
-            # Fill in actual values (no need to pad explicitly with pre-allocated zeros)
-            coords[i, :N] = pos
+            pos = d.pos.float()   # [N, 3]  raw Å coordinates
+            z   = d.z             # [N]     atomic numbers
+            N   = pos.size(0)
+
+            # Centre at the mean position of real atoms only.
+            # Using a simple mean (unweighted by mass) is standard for
+            # equivariant diffusion on QM9 and keeps the implementation
+            # simple; mass-weighted COM would need atomic mass look-ups
+            # but makes negligible practical difference on small molecules.
+            com = pos.mean(dim=0)   # [3]
+            pos = pos - com         # [N, 3]  now centred at origin
+
+            coords[i, :N]     = pos
             atom_types[i, :N] = z
-        
-        # Apply vocabulary mapping
-        atom_types = self.mapping[atom_types]
-        
-        # Normalize coordinates (as in GeoDiff)
-        coords = coords / 2.2
-        
+
+        # Map atomic numbers → one-hot encodings via pre-built lookup table.
+        # Padding rows (z=0) map to the all-zeros encoding, which is correct.
+        atom_types = self.mapping[atom_types]   # [B, max_N, vocab_size]
+
         return coords, atom_types
 
 
@@ -67,6 +77,7 @@ class MoleculeDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         val_split: float = 0.1,
         seed: int = 42,
+        max_N: int = None
     ):
         """
         Args:
@@ -90,13 +101,14 @@ class MoleculeDataModule(pl.LightningDataModule):
         # Will be set in setup()
         self.train_dataset = None
         self.val_dataset = None
-        self.max_N = None
+        self.max_N = max_N
 
     def setup(self, stage: Optional[str] = None):
         """Setup train/val datasets."""
         # Compute max number of atoms
-        N = [d.num_nodes for d in self.dataset]
-        self.max_N = max(N)
+        if not self.max_N:
+            N = [d.num_nodes for d in self.dataset]
+            self.max_N = max(N)
         
         # Create train/val split
         dataset_size = len(self.dataset)
@@ -182,7 +194,8 @@ def build_qm9_dataloader(
         batch_size=batch_size,
         num_workers=num_workers,
         val_split=val_split,
-        seed=seed
+        seed=seed,
+        max_N=max_N
     )
     
     return module, enc2atom, atom2enc
@@ -259,38 +272,36 @@ def compute_qm9_vocabulary(dataset: QM9) -> Tuple[torch.Tensor, torch.Tensor, in
         max_N: Maximum number of atoms in dataset
         class_weights: [vocab_size+1] weights for class balancing
     """
-    # QM9 atomic numbers (known apriori, but we can verify)
-    atomic_nums = {0, 1, 6, 7, 8, 9}  # 0 for padding
-    vocab_size = len(atomic_nums)
-    
-    # Create one-hot encodings
-    one_hot = F.one_hot(torch.arange(vocab_size))
-    
-    # Create mappings
-    vocab_atom2enc = {atom: encoding for atom, encoding in zip(sorted(atomic_nums), one_hot)}
-    
-    # enc2atom: [vocab_size] - index to atomic number
-    enc2atom = torch.tensor(sorted(atomic_nums), dtype=torch.long)
-    
-    # atom2enc: [max_atomic_num+1, vocab_size] - atomic number to one-hot
-    max_atomic_num = max(atomic_nums)
+    # QM9 real atomic numbers: H(1), C(6), N(7), O(8), F(9).
+    # Padding is represented by z=0 in the collated tensor and must map to
+    # an all-zero encoding so padded positions have no atom-type signal.
+    real_atomic_nums = [1, 6, 7, 8, 9]
+    vocab_size = len(real_atomic_nums)   # 5 — does NOT include padding
+
+    # enc2atom: [vocab_size] — encoding index → atomic number (no padding entry)
+    enc2atom = torch.tensor(real_atomic_nums, dtype=torch.long)
+
+    # atom2enc: [max_atomic_num+1, vocab_size]
+    # Row 0 (padding) is all-zeros (default from torch.zeros).
+    # Rows for real atoms are one-hot.
+    max_atomic_num = max(real_atomic_nums)
     atom2enc = torch.zeros((max_atomic_num + 1, vocab_size), dtype=torch.float32)
-    for atom_num, encoding in vocab_atom2enc.items():
-        atom2enc[atom_num] = encoding.float()
+    for enc_idx, atom_num in enumerate(real_atomic_nums):
+        atom2enc[atom_num, enc_idx] = 1.0
     
     # Compute max_N
     max_N = max(d.num_nodes for d in dataset)
     
-    # Pre-computed class weights (from your data)
-    # These are empirically tuned for QM9
+    # Inverse-frequency weights for the 5 real atom types [H, C, N, O, F].
+    # Padding positions are all-zero encodings and contribute zero gradient
+    # naturally, so no padding weight is needed.
+    # Approximate atom-type frequencies in QM9 (H >> C > O > N > F).
     class_weights = torch.tensor([
-        0.1921,  # padding
-        0.2093,  # H
-        0.2523,  # C
-        0.6322,  # N
-        0.5376,  # O
-        4.1765,  # F
-        0.0000   # extra padding
+        0.20,   # H  (most common)
+        0.25,   # C
+        0.63,   # N
+        0.54,   # O
+        4.18,   # F  (rare)
     ], dtype=torch.float32)
     
     print(f"Vocabulary: {sorted(atomic_nums)}")

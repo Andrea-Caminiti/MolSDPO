@@ -331,7 +331,7 @@ class DiffusionValidator:
                 coords = torch.randn(10, 29, 3, device=self.device)
                 atom_types = torch.randn(10, 29, 6, device=self.device)
                 
-                samples_batch = self._ddim_sample(coords, atom_types, num_steps=25)
+                samples_batch = self._ddim_sample(coords, atom_types, num_steps=1000)
                 samples.extend(samples_batch)
         
         # Convert to RDKit molecules
@@ -691,7 +691,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     module, vocab_enc2atom, vocab_atom2enc = build_qm9_dataloader(root=args.data_root, batch_size=args.batch_size, num_workers=args.num_workers)
     ABSORB_IDX = len(vocab_enc2atom)
-    checkpoint = torch.load('logs/TrainingSDPO/ckpts/epoch=0-step=11600-Reward0_mean=-1.9925.ckpt')['state_dict']
+    checkpoint = torch.load(r'logs\Pretrain\ckpts\epoch=79-step=18400-loss=1.28.ckpt')['state_dict']
     #checkpoint = {k[6:]: v for k,v in checkpoint.items()}
     checkpoint = {k[7 + k[6:].index('.'):]: v for k,v in checkpoint.items() if 'model' in k}
     tabasco = TabascoV2(atom_vocab_size=ABSORB_IDX, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, pos_coord_dim=128, pair_rbf_centers=args.d_model//2, dropout=0.1)
