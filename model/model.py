@@ -274,19 +274,23 @@ class TabascoV2(nn.Module):
         # FIX: previously used rbf.mean(dim=(1,2)) which collapsed all spatial
         # structure into a single scalar per head — every token pair received
         # the same bias, defeating the purpose of geometry-aware attention.
-        rbf = self.pair_rbf(coords, batched=False)           # (B, N, N, rbf_dim)
-        head_bias = self.rbf_to_bias(rbf)                    # (B, N, N, n_heads)
-        attn_bias  = head_bias.permute(0, 3, 1, 2).contiguous()  # (B, n_heads, N, N)
+        rbf = self.pair_rbf(coords, batched=batched)           # (B, N, N, rbf_dim)
+        head_bias = self.rbf_to_bias(rbf)       
+        # (B, N, N, n_heads)
+        if batched: 
+            attn_bias  = head_bias.permute(0, 1, 4, 2, 3).contiguous()  # (B, n_heads, N, N)
+        else:
+            attn_bias  = head_bias.permute(0, 3, 1, 2).contiguous()  # (B, n_heads, N, N)
 
         for blk in self.blocks:
-            x = blk(x, attn_bias=attn_bias, batched=False)
+            x = blk(x, attn_bias=attn_bias, batched=batched)
         
         half = self.d_model // 2
         a = x[..., :half]
         c = x[..., half:]
 
-        ac = self.crossAtomCoord(a, c, batched=False)
-        ca = self.crossCoordAtom(c, a, batched=False)
+        ac = self.crossAtomCoord(a, c, batched=batched)
+        ca = self.crossCoordAtom(c, a, batched=batched)
         
         x = torch.cat([ac, ca], dim=-1)
         
@@ -317,7 +321,24 @@ class LightningTabasco(pl.LightningModule):
             dropout=0.1
         )
         
+        self.register_buffer("loss_history", torch.ones(args.T) * 1000.0)
+        self.register_buffer("sampling_probs", torch.ones(args.T) / args.T)
+        self.alpha_ema = 0.01
         self.register_buffer("vocab_enc2atom", vocab_enc2atom)
+
+    @torch.no_grad()
+    def update_loss_history(self, t: torch.Tensor, losses: torch.Tensor):
+        for i in range(len(t)):
+            step_t = t[i].item()
+            self.loss_history[step_t] = (
+                (1 - self.alpha_ema) * self.loss_history[step_t] + 
+                self.alpha_ema * losses[i].item()
+            )
+        self.sampling_probs.copy_(self.get_sampling_weights())
+
+    def get_sampling_weights(self) -> torch.Tensor:
+        weights = torch.sqrt(self.loss_history.clamp(min=0)) + 1e-6
+        return weights / weights.sum()
     
     def configure_optimizers(self):
         base_lr = self.args.lr
@@ -353,32 +374,38 @@ class LightningTabasco(pl.LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
-        """Training step with uniform timestep sampling."""
+        """Training step with importance sampling."""
         self.model = self.model.train()
         coords, atom_types = batch
         B = coords.shape[0]
+        
+        t = torch.multinomial(
+            self.sampling_probs, 
+            B, 
+            replacement=True
+        ).to(self.device)
 
-        # Uniform timestep sampling: every timestep gets equal probability.
-        # Importance sampling (loss-proportional weighting) created a staircase
-        # learning pattern where the model focused exclusively on one band of
-        # timesteps at a time and starved others.  The adaptive denoise_w / geom_w
-        # in the loss already provide a soft curriculum, so an additional hard
-        # curriculum from importance sampling is counter-productive.
-        t = torch.randint(0, self.args.T, (B,), device=self.device)
-
+        # FIX: previously, a full forward pass was computed here and DISCARDED,
+        # then p_losses ran its own forward pass with *different* noise.
+        # Now we call p_losses once — single forward pass, consistent noise.
         loss, metrics = p_losses_joint_absorb_improved_efficient(
-            self.model, coords, atom_types, t,
+            self.model, coords, atom_types, t, 
             self.scheduler, self.device, lambda_type=1.0
         )
-
-        loss_mean = loss.mean()
-
+        
+        p_t = self.sampling_probs[t.squeeze()]
+        weights = 1.0 / (p_t * self.args.T)
+        
+        loss_weighted = (loss * weights).mean()
+        
+        self.update_loss_history(t.squeeze(), loss.detach())
+        
         self.log_dict({
-            'loss': loss_mean,
+            'loss': loss_weighted,
             **metrics
         }, on_step=True, prog_bar=False)
-
-        return loss_mean
+        
+        return loss_weighted
 
     def validation_step(self, batch, batch_idx):
         """Per-batch validation: denoising loss at 4 canonical timesteps."""
@@ -405,14 +432,14 @@ class LightningTabasco(pl.LightningModule):
 
                 coord_pred, atom_pred = self.model(noisy_atoms, noisy_coords, t)
 
-                # Mask padding atoms — consistent with training loss
-                real_mask  = atom_types.sum(dim=-1) > 0.5
+                # Mask coord loss to real atoms; type loss over all positions
+                # (consistent with training: model learns null class for padding)
+                real_mask  = atom_types.argmax(dim=-1) != 0
                 coord_mask = real_mask.unsqueeze(-1).expand_as(noise_c)
-                type_mask  = real_mask.unsqueeze(-1).expand_as(noise_a)
                 n_real     = real_mask.sum().float().clamp(min=1)
                 loss = (
                     ((coord_pred - noise_c) ** 2 * coord_mask).sum() / (n_real * 3)
-                    + ((atom_pred - noise_a) ** 2 * type_mask).sum()  / (n_real * atom_types.shape[-1])
+                    + F.mse_loss(atom_pred, noise_a)
                 )
 
                 self.log(
@@ -437,25 +464,33 @@ class LightningTabasco(pl.LightningModule):
 
         self.scheduler.set_timesteps(DDIM_STEPS, device=device)
 
+        timesteps = self.scheduler.timesteps   # e.g. [980, 960, 940, ..., 20, 0]
+
         with torch.no_grad():
-            for t in self.scheduler.timesteps:
+            for i, t in enumerate(timesteps):
                 t_batch = torch.full((NUM_SAMPLES,), t, device=device).long()
 
                 coord_pred, atom_pred = self.model(atoms, coords, t_batch)
 
-                alpha_t      = self.scheduler.alphas_cumprod[t].to(device)
-                alpha_t_prev = (
-                    self.scheduler.alphas_cumprod[t - 1].to(device)
-                    if t > 0
-                    else torch.ones(1, device=device)
-                )
+                alpha_t = self.scheduler.alphas_cumprod[t].to(device)
 
-                # DDIM update (deterministic)
+                # BUG WAS HERE: using alphas_cumprod[t - 1] when t is e.g. 960
+                # gives alphas_cumprod[959], advancing only 1/1000 of the schedule.
+                # The correct previous timestep is the NEXT entry in the DDIM
+                # sequence (e.g. 940), not t minus one.
+                if i + 1 < len(timesteps):
+                    t_prev     = timesteps[i + 1]
+                    alpha_prev = self.scheduler.alphas_cumprod[t_prev].to(device)
+                else:
+                    # Final step: x_{-1} = x0
+                    alpha_prev = torch.ones(1, device=device)
+
+                # Deterministic DDIM update
                 x0_c = (coords - (1 - alpha_t).sqrt() * coord_pred) / alpha_t.sqrt()
                 x0_a = (atoms  - (1 - alpha_t).sqrt() * atom_pred)  / alpha_t.sqrt()
 
-                coords = alpha_t_prev.sqrt() * x0_c + (1 - alpha_t_prev).sqrt() * coord_pred
-                atoms  = alpha_t_prev.sqrt() * x0_a + (1 - alpha_t_prev).sqrt() * atom_pred
+                coords = alpha_prev.sqrt() * x0_c + (1 - alpha_prev).sqrt() * coord_pred
+                atoms  = alpha_prev.sqrt() * x0_a + (1 - alpha_prev).sqrt() * atom_pred
 
         atom_indices = atoms.argmax(dim=-1)
         atom_nums    = self.vocab_enc2atom[atom_indices]

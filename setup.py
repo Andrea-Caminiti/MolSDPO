@@ -6,19 +6,20 @@ setup(
     packages=["MolSDPO"],
     python_requires=">=3.10",
     install_requires=[
-        "numpy==1.26.1",
+        "numpy",
         "ml-collections",
         "absl-py",
         "matplotlib",
         "torch>=2.8",
         "torch-geometric",
-        "inflect==6.0.4",
-        "pydantic==1.10.9",
+        "inflect",
+        "pydantic",
         "hpsv2",
         "tqdm",
-        "rdkit==2024.09.4",
+        "rdkit",
         "openbabel-wheel",
-        "lightning==2.0.3",
+        "lightning",
         "diffusers",
+        "posebusters"
     ]
     )

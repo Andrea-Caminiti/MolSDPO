@@ -134,40 +134,28 @@ def build_mol(
 
 
 def _neutralise_charges(mol: Chem.Mol) -> Optional[Chem.Mol]:
-    """
-    Remove common spurious charges introduced by bond order perception.
-    Handles: N+, O-, carboxylate → carboxylic acid, etc.
-    Based on the Brenk neutralisation SMARTS patterns.
-    """
-    # Minimal set sufficient for H/C/N/O/F (your atom vocabulary)
     patterns = [
-        ('[n+;H]',   'n'),          # protonated aromatic N
-        ('[N+;H2]',  'N'),          # ammonium NH2+
-        ('[N+;H]',   'N'),          # ammonium NH+
-        ('[OH-]',    'O'),           # hydroxide
-        ('[O-]',     'O'),           # generic anion
-        ('[NH-]',    'N'),           # amide anion
+        '[n+;H]',
+        '[N+;H2]',
+        '[N+;H]',
+        '[OH-]',
+        '[O-]',
+        '[NH-]',
     ]
     try:
         rw = Chem.RWMol(mol)
-        for smarts, replacement in patterns:
+        for smarts in patterns:
             query = Chem.MolFromSmarts(smarts)
             if query is None:
                 continue
-            while rw.HasSubstructMatch(query):
-                rw = Chem.RWMol(
-                    AllChem.ReplaceSubstructs(
-                        rw.GetMol(), query,
-                        Chem.MolFromSmiles(replacement)
-                    )[0]
-                )
+            for match in rw.GetSubstructMatches(query):
+                atom = rw.GetAtomWithIdx(match[0])
+                atom.SetFormalCharge(0)
+                atom.SetNumExplicitHs(0)
         Chem.SanitizeMol(rw)
-        # Re-attach the original conformer
-        conf = mol.GetConformer()
-        rw.AddConformer(conf, assignId=True)
         return rw.GetMol()
     except Exception:
-        return mol   # return original rather than None on neutralisation failure
+        return mol  # return original rather than None on neutralisation failure
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +300,14 @@ def generate_sdf(
             x     = torch.randn(B, n_atoms, 3,       device=device)
             types = torch.randn(B, n_atoms, atom_dim, device=device)
 
-            result, _, _, _, _, _, _ = pipeline_with_logprob(
+            result, *_ = pipeline_with_logprob(
                 model, x, types,
                 scheduler=scheduler, B=B,
                 device=device,
                 num_inference_steps=sample_steps,
                 eta=eta,
             )
-
+            result[2] = [result[2][:, :, :3], result[2][:, :, 3:]]
             rdkit_mols = build_mols_from_pipeline_output(
                 result[2], vocab, scale=scale, remove_hs=remove_hs
             )

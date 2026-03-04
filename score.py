@@ -26,13 +26,11 @@ if __name__ == '__main__':
     parser.add_argument('--sample-steps', type=int, default=25)
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
-    module, enc2atom, _ = build_qm9_dataloader()
-    module.setup()
-    dl = load_qm9_smiles_from_dataset(module.train_dataset)
+    module, enc2atom, _, smiles = build_qm9_dataloader()
     device = 'cuda'
     ABSORB_IDX = len(enc2atom)
     enc2atom = enc2atom.to(device)
-    checkpoint = torch.load('logs/TrainingSDPO/ckpts/epoch=0-step=15800-Reward0_mean=0.4852.ckpt')['state_dict']
+    checkpoint = torch.load('logs/TrainingSDPO/ckpts/epoch=0-step=600-Reward0_mean=0.989128589630127.ckpt')['state_dict']
     #checkpoint = {k[6:]: v for k, v in checkpoint.items() if 'model' in k}
     checkpoint = {k[7 + k[6:].index('.'):]: v for k, v in checkpoint.items() if 'model' in k}
     tabasco = TabascoV2(
@@ -43,32 +41,10 @@ if __name__ == '__main__':
     tabasco.load_state_dict(checkpoint)
     tabasco = tabasco.to(device)
     scheduler = DDIMScheduler.from_config(DDIM_config)
-    # Run this on one batch before build_mol to diagnose
-    with torch.no_grad():
-        x     = torch.randn(4, 29, 3, device=device)
-        types = torch.randn(4, 29, 6, device=device)
-        result, _, _, _, _, _, _ = pipeline_with_logprob(tabasco, x, types, scheduler, 'cuda')
-        
-        atom_oh = result[2][1]                      # [B, N, A] one-hot
-        predicted_indices = atom_oh.argmax(-1)      # [B, N]
-        atomic_nums = enc2atom[predicted_indices]       # [B, N]
-        
-        print("Predicted class indices:\n", predicted_indices[0])   # what class is predicted?
-        print("Atomic numbers after vocab:\n", atomic_nums[0])      # how many non-zero?
-        print("Non-padding atoms per molecule:", (atomic_nums != 0).sum(-1))
-        last_coords = result[2][0]   # [B, N, 3], before scale
-
-        print("Raw coord std:", last_coords.std().item())
-        print("Scaled coord std:", (last_coords * 2.2).std().item())
-
-        from torch.nn.functional import pdist
-        dists = pdist(last_coords[0] * 2.2)
-        print("Scaled pairwise dists — min:", dists.min().item(), 
-                                    "mean:", dists.mean().item(),
-                                    "max:", dists.max().item())
-    results = generate_sdf(tabasco, scheduler, enc2atom, args.device, 'preliminary_test.sdf', 1000, eta=0.5, scale=1.0)
+       
+    results = generate_sdf(tabasco, scheduler, enc2atom, args.device, 'test1.sdf', 1000, eta=1.0, scale=1.0)
     
-    with open('preliminary_test.txt', 'w') as f:
+    with open('test1.txt', 'w') as f:
         f.write('Generated 1000 mols\n')
         for k, v in results.items():
             f.write(f'{k}: {v}\n')

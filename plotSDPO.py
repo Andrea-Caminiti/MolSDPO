@@ -13,7 +13,7 @@ def plot_rl_metrics(df, outpath, composed, switch):
         'reward_clena_mean': ['Reward0_mean'],
         'reward_stats': ['Reward_gap_start', 'Reward_gap_last'],
         'training_loss_stats': ['Training_loss'],
-        'diffs': ['log_diff', 'advantage_diff'],
+        'diffs': ['weighted_log_diff', 'advantage_diff'],
         'mol_quality_metrics': ['val/qed', 'val/sa_score', 'val/mol_weight'],
         'mol_diversity_metrics': ['val/novelty', 'val/diversity', 'val/uniqueness', 'val/validity'],
         'stopping_criteria': ['val/stopping_score']
@@ -28,7 +28,7 @@ def plot_rl_metrics(df, outpath, composed, switch):
             for col in cols:
                 if col in df.columns:
                     # Drop NaN values for this specific column to avoid breaks in the line
-                    valid_df = df[df['step'] > 200].dropna(subset=[col, 'step'])
+                    valid_df = df.dropna(subset=[col, 'step'])
                     if not valid_df.empty:
                         plt.plot(valid_df['step'], valid_df[col], label=col, alpha=0.8)
                         

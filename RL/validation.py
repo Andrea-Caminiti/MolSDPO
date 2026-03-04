@@ -23,7 +23,7 @@ from rdkit.Chem import AllChem, QED, rdDetermineBonds, Descriptors
 from rdkit.DataStructs import BulkTanimotoSimilarity
 from typing import List, Tuple, Optional, Dict
 from tqdm import tqdm
-# SA score — needs RDKit contrib. Gracefully degrade if unavailable.
+
 try:
     from rdkit.Contrib.SA_Score import sascorer
     _HAS_SA = True
@@ -34,7 +34,6 @@ except ImportError:
     except ImportError:
         _HAS_SA = False
 
-
 from RL.SDPO import pipeline_with_logprob
 import tempfile
 import os
@@ -42,10 +41,7 @@ from openbabel import openbabel
 from rdkit import Chem
 import multiprocessing as mp
 
-# FIX 1: Always use 'spawn' to avoid CUDA + fork deadlocks.
-# After PyTorch initialises CUDA, forking a process leaves CUDA's internal
-# mutexes in a locked state in the child, causing an immediate hang.
-# 'spawn' starts a fresh interpreter with no inherited CUDA state.
+# Always use 'spawn' to avoid CUDA + fork deadlocks.
 _MP_CTX = mp.get_context('spawn')
 
 
@@ -53,11 +49,12 @@ def _atomic_num_to_symbol(z: int) -> str:
     pt = Chem.GetPeriodicTable()
     return pt.GetElementSymbol(z)
 
+
 def _write_xyz(path: str, zs: list, xyz) -> None:
     """Write a minimal XYZ file from atomic numbers and coordinates."""
-    lines = [str(len(zs)), '']  # atom count + blank comment line
-    for z, (x, y, w) in zip(zs, xyz):
-        lines.append(f'{_atomic_num_to_symbol(z):<3} {x:12.6f} {y:12.6f} {w:12.6f}')
+    lines = [str(len(zs)), '']
+    for z, (x, y, coord_z) in zip(zs, xyz):   # coord_z: third spatial coordinate
+        lines.append(f'{_atomic_num_to_symbol(z):<3} {x:12.6f} {y:12.6f} {coord_z:12.6f}')
     with open(path, 'w') as f:
         f.write('\n'.join(lines))
 
@@ -65,14 +62,13 @@ def _write_xyz(path: str, zs: list, xyz) -> None:
 def _coords_to_mol_worker(args) -> Optional[str]:
     """
     Subprocess worker: XYZ -> OpenBabel bond inference -> molblock string.
-    Returns MolBlock string or None. Molblock is used so coordinates survive
-    the process boundary (SMILES would discard the conformer).
+    Returns MolBlock string or None.
     """
     zs, xyz = args
 
     mask = [z != 0 for z in zs]
-    zs  = [z for z, m in zip(zs, mask) if m]
-    xyz = [c for c, m in zip(xyz, mask) if m]
+    zs   = [z for z, m in zip(zs, mask) if m]
+    xyz  = [c for c, m in zip(xyz, mask) if m]
 
     if len(zs) < 2:
         return None
@@ -95,7 +91,6 @@ def _coords_to_mol_worker(args) -> Optional[str]:
         if tmp_mol is None:
             return None
 
-        # Rebuild mol to strip radicals (same workaround as original)
         mol = Chem.RWMol()
         for atom in tmp_mol.GetAtoms():
             mol.AddAtom(Chem.Atom(atom.GetSymbol()))
@@ -104,11 +99,11 @@ def _coords_to_mol_worker(args) -> Optional[str]:
             mol.AddBond(
                 bond.GetBeginAtomIdx(),
                 bond.GetEndAtomIdx(),
-                bond.GetBondType()
+                bond.GetBondType(),
             )
 
         Chem.SanitizeMol(mol)
-        return Chem.MolToMolBlock(mol)  # preserves 3D coords across process boundary
+        return Chem.MolToMolBlock(mol)
 
     except Exception:
         try:
@@ -118,24 +113,18 @@ def _coords_to_mol_worker(args) -> Optional[str]:
         return None
 
 
-def coords_to_mol(atomic_nums: torch.Tensor, coords: torch.Tensor, timeout: float = 5.0) -> Optional[Chem.Mol]:
+def coords_to_mol(
+    atomic_nums: torch.Tensor,
+    coords     : torch.Tensor,
+    timeout    : float = 5.0,
+) -> Optional[Chem.Mol]:
     """
     Build an RDKit Mol from atomic number and coordinate tensors using
-    OpenBabel for bond inference. Runs in a subprocess with a hard timeout
-    so hung OpenBabel calls are forcibly killed rather than blocking forever.
-
-    Args:
-        atomic_nums : [N] integer tensor of atomic numbers (0 = padding)
-        coords      : [N, 3] float tensor in Angstroms
-        timeout     : seconds before the subprocess is hard-killed
-
-    Returns:
-        RDKit Mol with 3D conformer, or None on failure/timeout.
+    OpenBabel for bond inference.  Runs in a subprocess with a hard timeout.
     """
     zs  = atomic_nums.cpu().tolist()
     xyz = coords.cpu().float().numpy().tolist()
 
-    # FIX 1 (applied): Use _MP_CTX (spawn) instead of mp.Pool (fork).
     with _MP_CTX.Pool(processes=1) as pool:
         fut = pool.apply_async(_coords_to_mol_worker, ((zs, xyz),))
         try:
@@ -153,25 +142,12 @@ def coords_to_mol(atomic_nums: torch.Tensor, coords: torch.Tensor, timeout: floa
 
 def _coords_to_mol_batch(
     args_list: list,
-    timeout: float = 2.0,
-    n_workers: int = 0,
+    timeout  : float = 2.0,
+    n_workers: int   = 0,
 ) -> Tuple[List[Optional[Chem.Mol]], int]:
     """
-    FIX 2: Convert a whole batch of molecules using a single shared pool.
-
-    Previously, evaluate() called coords_to_mol() (which spawns its own pool)
-    in a serial loop — creating and destroying 512+ processes one at a time,
-    each paying the full spawn overhead.  This function submits all tasks to
-    one pool up front, collects results with per-task timeouts, and terminates
-    the pool only once at the end.
-
-    Args:
-        args_list : list of (zs, xyz) tuples (plain Python lists, picklable)
-        timeout   : per-molecule wall-clock timeout in seconds
-        n_workers : pool size; 0 → min(cpu_count, len(args_list))
-
-    Returns:
-        (mols, n_timeouts) where mols[i] is the RDKit Mol or None
+    Convert a whole batch of molecules using a single shared pool.
+    Avoids the overhead of spawning a new pool per molecule.
     """
     if not args_list:
         return [], 0
@@ -188,13 +164,13 @@ def _coords_to_mol_batch(
         for args, fut in zip(args_list, futures):
             try:
                 molblock = fut.get(timeout=timeout)
-                if molblock is None:
-                    mols.append(None)
-                else:
-                    mols.append(Chem.MolFromMolBlock(molblock, sanitize=False, removeHs=False))
+                mols.append(
+                    None if molblock is None
+                    else Chem.MolFromMolBlock(molblock, sanitize=False, removeHs=False)
+                )
             except mp.TimeoutError:
                 mols.append(None)
-                if args[0]:  # non-empty atom list → genuine timeout, not padding
+                if args[0]:
                     n_timeouts += 1
             except Exception:
                 mols.append(None)
@@ -214,44 +190,30 @@ def _mol_to_smiles(mol: Optional[Chem.Mol]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Individual metrics
+# Metrics
 # ---------------------------------------------------------------------------
 
 def compute_validity_uniqueness_novelty(
-    mols: List[Optional[Chem.Mol]],
+    mols        : List[Optional[Chem.Mol]],
     train_smiles: set,
 ) -> Tuple[float, float, float, List[str], List[Chem.Mol]]:
     """
     Returns (validity, uniqueness, novelty, valid_smiles_list, unique_mols).
 
-    Definitions:
       validity   = n_valid  / n_total
       uniqueness = n_unique / n_valid
-      novelty    = n_novel  / n_unique  (unique valid not in train set)
-
-    unique_mols is returned so downstream callers can skip re-parsing SMILES.
+      novelty    = n_novel  / n_unique
     """
     n_total = len(mols)
-
-    # FIX 3: Run SMILES conversion in-process instead of via ProcessPoolExecutor.
-    #
-    # The original code passed RDKit Mol objects to a ProcessPoolExecutor.
-    # Mol objects are pickled across the process boundary on every call, which
-    # is expensive and can silently hang when the pickled C++ state is large or
-    # contains non-picklable internals (platform/build dependent).
-    # MolToSmiles is fast enough that the serialisation overhead dominates anyway.
     smiles_results = [_mol_to_smiles(mol) for mol in mols]
 
-    # Keep valid (smiles, mol) pairs together to avoid re-parsing later
     valid_pairs: List[Tuple[str, Chem.Mol]] = [
         (smi, mol)
         for smi, mol in zip(smiles_results, mols)
         if smi is not None
     ]
-
     n_valid = len(valid_pairs)
 
-    # Deduplicate while preserving order; keep the mol for each unique SMILES
     seen: Dict[str, Chem.Mol] = {}
     for smi, mol in valid_pairs:
         if smi not in seen:
@@ -261,61 +223,23 @@ def compute_validity_uniqueness_novelty(
     unique_mols   = list(seen.values())
     n_unique      = len(unique_smiles)
 
-    validity   = n_valid  / n_total  if n_total  > 0 else 0.0
-    uniqueness = n_unique / n_valid  if n_valid  > 0 else 0.0
-
-    # train_smiles is already a set, so `not in` is O(1)
-    n_novel = sum(1 for s in unique_smiles if s not in train_smiles)
-    novelty = n_novel / n_unique if n_unique > 0 else 0.0
+    validity   = n_valid  / n_total if n_total  > 0 else 0.0
+    uniqueness = n_unique / n_valid if n_valid  > 0 else 0.0
+    n_novel    = sum(1 for s in unique_smiles if s not in train_smiles)
+    novelty    = n_novel / n_unique if n_unique > 0 else 0.0
 
     return validity, uniqueness, novelty, unique_smiles, unique_mols
 
 
-def compute_diversity(smiles_list: List[str], max_mols: int = 1000) -> float:
-    """
-    Internal diversity = 1 - mean pairwise Tanimoto (Morgan r=2 bit fingerprints).
-
-    Uses bit vectors (faster Tanimoto) and caps at max_mols to keep O(n²) tractable.
-    """
-    n = len(smiles_list)
-    if n < 2:
-        return 0.0
-
-    if n > max_mols:
-        smiles_list = list(np.random.choice(smiles_list, max_mols, replace=False))
-
-    # FIX: walrus operator bug — filter and assign must be separated
-    mols = [Chem.MolFromSmiles(s) for s in smiles_list]
-    mols = [m for m in mols if m is not None]
-    if len(mols) < 2:
-        return 0.0
-
-    # Bit vectors are faster for Tanimoto than sparse count fingerprints
-    fps = [AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048) for m in mols]
-
-    sim_sum = 0.0
-    count   = 0
-    for i in range(len(fps)):
-        sims     = BulkTanimotoSimilarity(fps[i], fps[i + 1:])
-        sim_sum += sum(sims)
-        count   += len(sims)
-
-    return 1.0 - (sim_sum / count) if count > 0 else 0.0
-
-
 def compute_diversity_from_mols(mols: List[Chem.Mol], max_mols: int = 1000) -> float:
-    """
-    Same as compute_diversity but accepts pre-built Mol objects, avoiding re-parsing.
-    """
+    """1 - mean pairwise Tanimoto (Morgan r=2) over unique valid mols."""
     if len(mols) < 2:
         return 0.0
-
     if len(mols) > max_mols:
         indices = np.random.choice(len(mols), max_mols, replace=False)
-        mols = [mols[i] for i in indices]
+        mols    = [mols[i] for i in indices]
 
-    fps = [AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048) for m in mols]
-
+    fps     = [AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048) for m in mols]
     sim_sum = 0.0
     count   = 0
     for i in range(len(fps)):
@@ -327,27 +251,19 @@ def compute_diversity_from_mols(mols: List[Chem.Mol], max_mols: int = 1000) -> f
 
 
 def compute_drug_properties(mols: List[Chem.Mol]) -> Dict[str, float]:
-    """
-    Returns mean QED, mean SA score (if available), and mean MW.
-    Accepts pre-built Mol objects to avoid redundant SMILES re-parsing.
-    """
+    """Returns mean QED, SA score (if available), and mean MW."""
     mols = [m for m in mols if m is not None]
     if not mols:
         return {'qed': 0.0, 'sa': 0.0, 'mw': 0.0}
 
-    qeds = [QED.qed(m)          for m in mols]
-    mws  = [Descriptors.MolWt(m) for m in mols]
-
     result = {
-        'qed': float(np.mean(qeds)),
-        'mw':  float(np.mean(mws)),
+        'qed': float(np.mean([QED.qed(m)           for m in mols])),
+        'mw':  float(np.mean([Descriptors.MolWt(m) for m in mols])),
         'sa':  0.0,
     }
-
     if _HAS_SA:
         try:
-            sas = [sascorer.calculateScore(m) for m in mols]
-            result['sa'] = float(np.mean(sas))
+            result['sa'] = float(np.mean([sascorer.calculateScore(m) for m in mols]))
         except Exception:
             pass
 
@@ -364,36 +280,38 @@ def sample_molecules(
     scheduler,
     vocab,            # enc2atom tensor  [A] → atomic numbers
     device,
-    n_samples:    int = 256,
-    n_atoms:      int = 29,
-    atom_dim:     int = 6,
-    sample_steps: int = 25,
-    eta:          float = 1.0,
-    batch_size:   int = 32,
+    n_samples   : int   = 256,
+    n_atoms     : int   = 29,
+    sample_steps: int   = 25,
+    eta         : float = 1.0,
+    batch_size  : int   = 32,
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """
     Generate n_samples molecules in batches.
+
+    atom_dim is inferred from vocab.shape[0] so it stays consistent with
+    whatever vocabulary the model was built with.
+
     Returns list of (coords [N,3], atom_types_onehot [N,A]) tuples.
     """
-
+    atom_dim = vocab.shape[0]   # inferred from vocab, not hard-coded
     model.eval()
     all_last = []
 
     for start in range(0, n_samples, batch_size):
         B     = min(batch_size, n_samples - start)
-        x     = torch.randn(B, n_atoms, 3,       device=device)
-        types = torch.randn(B, n_atoms, atom_dim, device=device)
+        x     = torch.randn(B, n_atoms, 3,        device=device)
+        types = torch.randn(B, n_atoms, atom_dim,  device=device)
 
-        mols, _, _, _, _, _, _ = pipeline_with_logprob(
+        mols, *_ = pipeline_with_logprob(
             model, x, types,
             scheduler=scheduler, B=B,
             device=device,
             num_inference_steps=sample_steps,
             eta=eta,
         )
-        last_coords = mols[2][0]   # [B, N, 3]
-        last_types  = mols[2][1]   # [B, N, A]
-
+        last_coords = mols[2][:, :, :3]   # [B, N, 3]
+        last_types  = mols[2][:, :, 3:]   # [B, N, A]
         for b in range(B):
             all_last.append((last_coords[b], last_types[b]))
 
@@ -401,20 +319,14 @@ def sample_molecules(
 
 
 # ---------------------------------------------------------------------------
-# Full evaluation
+# SDF writer
 # ---------------------------------------------------------------------------
+
 def _mol_to_sdf_block(args: Tuple) -> Optional[str]:
-    """
-    Worker: annotate one molecule and render it to an SDF block string.
-
-    Runs in a Process pool — each mol is independent, so no locking needed.
-    We work on a fresh RWMol copy so we never mutate the caller's objects.
-
-    Returns the SDF block string, or None if anything fails.
-    """
+    """Annotate one molecule and render it to an SDF block string."""
     mol, smi, train_smiles_set, kekulize = args
     try:
-        rw = Chem.RWMol(mol)                          # cheap copy; don't mutate caller's mol
+        rw = Chem.RWMol(mol)
         rw.SetProp('SMILES',          smi)
         rw.SetDoubleProp('QED',       QED.qed(rw))
         rw.SetDoubleProp('MolWeight', Descriptors.MolWt(rw))
@@ -428,61 +340,32 @@ def _mol_to_sdf_block(args: Tuple) -> Optional[str]:
         if train_smiles_set is not None:
             rw.SetIntProp('Novel', int(smi not in train_smiles_set))
 
-        # MolToMolBlock is the same C++ path SDWriter uses internally,
-        # but returning a string lets us batch all I/O into one write().
         block = Chem.MolToMolBlock(rw, kekulize=kekulize)
-        return block + '$$$$\n'           # SDF record terminator
+        return block + '$$$$\n'
     except Exception:
         return None
 
-    
+
 def write_unique_mols_sdf(
-    mols: List[Optional[Chem.Mol]],
-    path: str,
-    train_smiles: Optional[set] = None,
-    kekulize: bool = False,
-    # ── Fast-path: pass these when calling from evaluate() so dedup is skipped ──
-    unique_smiles: Optional[List[str]]      = None,
-    unique_mols:   Optional[List[Chem.Mol]] = None,
+    mols         : List[Optional[Chem.Mol]],
+    path         : str,
+    train_smiles : Optional[set]       = None,
+    kekulize     : bool                = False,
+    unique_smiles: Optional[List[str]] = None,
+    unique_mols  : Optional[List[Chem.Mol]] = None,
 ) -> int:
     """
-    Deduplicate a list of RDKit Mols (by canonical SMILES) and write them to
-    an SDF file.  Annotates each record with SMILES, QED, MolWeight, SA_Score,
-    and (optionally) a Novel flag.
+    Deduplicate a list of RDKit Mols (by canonical SMILES) and write to SDF.
 
-    Performance notes
-    -----------------
-    * If you already have ``unique_smiles`` + ``unique_mols`` from a previous
-      call to ``compute_validity_uniqueness_novelty`` or ``evaluate()``, pass
-      them in — deduplication (the most expensive serial step) is skipped
-      entirely.
-    * All SDF blocks are accumulated in memory and flushed to disk in a single
-      ``write()`` call, minimising syscall overhead.
+    If unique_smiles + unique_mols are provided (e.g. from evaluate()),
+    deduplication is skipped entirely.
 
-    Args:
-        mols          : raw generated mols (may contain None / duplicates).
-                        Ignored when ``unique_smiles`` + ``unique_mols`` are
-                        both provided.
-        path          : output file path, e.g. ``'generated.sdf'``
-        train_smiles  : if provided, tags each record with ``Novel=1/0``
-        kekulize      : write Kekulé form (explicit single/double bonds) rather
-                        than aromatic bonds — required by some downstream tools
-        unique_smiles : pre-computed list of unique canonical SMILES
-        unique_mols   : pre-computed list of unique Mol objects (same order)
-
-    Returns:
-        Number of unique valid molecules written.
+    Returns the number of unique valid molecules written.
     """
-    # ------------------------------------------------------------------
-    # 1. Deduplication — O(n) in-process SMILES conversion
-    #    Skipped entirely when the caller provides pre-computed uniques.
-    # ------------------------------------------------------------------
     if unique_smiles is not None and unique_mols is not None:
         u_smiles, u_mols = unique_smiles, unique_mols
     else:
-        # FIX 3 (applied here too): convert in-process to avoid pickling Mol objects.
-        smi_results: List[Optional[str]] = [_mol_to_smiles(m) for m in mols]
-
+        smi_results = [_mol_to_smiles(m) for m in mols]
         seen: Dict[str, Chem.Mol] = {}
         for smi, mol in zip(smi_results, mols):
             if smi is not None and mol is not None and smi not in seen:
@@ -493,66 +376,56 @@ def write_unique_mols_sdf(
     if not u_mols:
         return 0
 
-    # ------------------------------------------------------------------
-    # 2. Property computation + SDF-block rendering — in-process
-    #    (pickling Mol objects into a ProcessPoolExecutor is unreliable
-    #     and often slower than in-process for typical batch sizes)
-    # ------------------------------------------------------------------
-    blocks: List[Optional[str]] = [
+    blocks = [
         _mol_to_sdf_block((mol, smi, train_smiles, kekulize))
         for mol, smi in zip(u_mols, u_smiles)
     ]
-
-    # ------------------------------------------------------------------
-    # 3. Single buffered write — one syscall for the entire file
-    # ------------------------------------------------------------------
     valid_blocks = [b for b in blocks if b is not None]
     with open(path, 'w') as fh:
         fh.write(''.join(valid_blocks))
 
     return len(valid_blocks)
 
+
+# ---------------------------------------------------------------------------
+# Full evaluation
+# ---------------------------------------------------------------------------
+
 def evaluate(
     model,
     scheduler,
     vocab,
-    train_smiles: set,
+    train_smiles : set,
     device,
-    n_samples:    int   = 512,
-    sample_steps: int   = 25,
-    eta:          float = 1.0,
-    batch_size:   int   = 32,
-    mol_timeout:  float = 2.0,
+    n_samples    : int   = 512,
+    sample_steps : int   = 25,
+    eta          : float = 1.0,
+    batch_size   : int   = 32,
+    mol_timeout  : float = 2.0,
 ) -> Dict[str, float]:
     """
-    Full evaluation pass. Returns a dict of all metrics plus stopping_score.
+    Full evaluation pass.
 
     stopping_score = validity × uniqueness
-      - Drops when model collapses (validity falls) or mode-collapses (uniqueness falls)
-      - Does NOT depend on the training reward function (avoids Goodhart's law)
-      - Simple, interpretable, and fast to compute
+      - Drops on model collapse (validity ↓) or mode collapse (uniqueness ↓)
+      - Independent of training reward (avoids Goodhart's law)
     """
     samples = sample_molecules(
         model, scheduler, vocab, device,
-        n_samples=n_samples,
-        sample_steps=sample_steps,
-        eta=eta,
-        batch_size=batch_size,
+        n_samples    = n_samples,
+        sample_steps = sample_steps,
+        eta          = eta,
+        batch_size   = batch_size,
     )
 
-    # All CUDA work done on the main process to avoid process-safety issues.
-    # coords scaled to Angstroms here (×2.2), then moved to CPU for subprocess pickling.
     worker_args = [
         (
             vocab[atom_types_oh.argmax(-1)].cpu().tolist(),
-            (coords * 2.2).cpu().float().numpy().tolist(),
+            coords.cpu().float().numpy().tolist(),
         )
         for coords, atom_types_oh in samples
     ]
 
-    # FIX 2 (applied): use a single shared pool for all molecules instead of
-    # spawning a new pool per molecule.  The old per-molecule loop created and
-    # destroyed 512+ processes serially, paying the full spawn cost every time.
     mols, n_timeouts = _coords_to_mol_batch(worker_args, timeout=mol_timeout)
 
     if n_timeouts > 0:
@@ -561,29 +434,23 @@ def evaluate(
     validity, uniqueness, novelty, unique_smiles, unique_mols = \
         compute_validity_uniqueness_novelty(mols, train_smiles)
 
-    # Reuse unique_mols — no re-parsing of SMILES required
     diversity = compute_diversity_from_mols(unique_mols)
     drug      = compute_drug_properties(unique_mols)
 
-    stopping_score = validity * uniqueness
-    
     return {
-        # ── Core generative quality ──────────────────────────────────────
         'validity':       validity,
         'uniqueness':     uniqueness,
         'novelty':        novelty,
         'diversity':      diversity,
-        'stopping_score': stopping_score,
-        # ── Molecular quality ────────────────────────────────────────────
+        'stopping_score': validity * uniqueness,
         'qed':            drug['qed'],
         'sa_score':       drug['sa'],
         'mol_weight':     drug['mw'],
-        # ── Counts ───────────────────────────────────────────────────────
         'n_valid':        int(validity   * n_samples),
         'n_unique':       int(uniqueness * validity * n_samples),
-        # ── Diagnostics ─────────────────────────────────────────────────
         'n_timeouts':     n_timeouts,
     }, unique_mols, unique_smiles
+
 
 # ---------------------------------------------------------------------------
 # Lightning integration
@@ -596,24 +463,7 @@ class ValidationMixin:
     Usage:
         class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             ...
-
-    In train.py, add to Trainer:
-        from lightning.pytorch.callbacks import EarlyStopping
-        early_stop = EarlyStopping(
-            monitor='val/stopping_score',
-            mode='max',
-            patience=20,
-            min_delta=0.001,
-        )
-        trainer = pl.Trainer(..., callbacks=[..., early_stop])
-
-    Set check_val_every_n_epoch or val_check_interval in Trainer to control
-    how often validation runs (recommend every 200–500 training steps).
     """
-
-    # Set these in __init__ of the main class:
-    #   self.train_smiles : set of canonical SMILES from QM9 training split
-    #   self.val_n_samples : int, e.g. 256 during training, 2048 for final eval
 
     def validation_step(self, batch, batch_idx):
         pass
@@ -636,5 +486,4 @@ class ValidationMixin:
 
         for k, v in metrics.items():
             if isinstance(v, float):
-                self.log(f'val/{k}', v, prog_bar=(k == 'stopping_score'),
-                         sync_dist=True)
+                self.log(f'val/{k}', v, prog_bar=(k == 'stopping_score'), sync_dist=True)

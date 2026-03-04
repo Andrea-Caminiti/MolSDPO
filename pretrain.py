@@ -14,7 +14,7 @@ def ema_avg_fn(averaged_model_parameter, current_model_parameter):
 
 
 def pretrain(args):
-
+    torch.set_float32_matmul_precision('high')
     module, vocab_enc2atom, vocab_atom2enc = build_qm9_dataloader(
         root=args.data_root, batch_size=args.batch_size, num_workers=args.num_workers
     )
@@ -43,7 +43,7 @@ def pretrain(args):
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=1,
-        precision="bf16-mixed",
+        precision="32",
         max_steps=args.max_steps,
         enable_progress_bar=True,
         logger=CSVLogger("logs", name="Pretrain"),
@@ -51,7 +51,7 @@ def pretrain(args):
         callbacks=[checkpoint_callback, early_stop],
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
-        val_check_interval=1000,
+        val_check_interval=2500,
     )
 
     model = LightningTabasco(args, vocab_enc2atom)
