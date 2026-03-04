@@ -182,7 +182,7 @@ def build_qm9_dataloader(
     dataset = QM9(root)
     
     # Get or compute vocabulary
-    enc2atom, atom2enc, max_N, class_weights = get_qm9_vocabulary(
+    enc2atom, atom2enc, max_N, class_weights, smiles = get_qm9_vocabulary(
         dataset, root, cache=cache_vocab
     )
     
@@ -198,7 +198,7 @@ def build_qm9_dataloader(
         max_N=max_N
     )
     
-    return module, enc2atom, atom2enc
+    return module, enc2atom, atom2enc, smiles
 
 
 def get_qm9_vocabulary(
@@ -221,26 +221,32 @@ def get_qm9_vocabulary(
         class_weights: Class weights for balancing
     """
     cache_path = os.path.join(root, 'qm9_vocab_cache.pkl')
-    
+    smiles_path = os.path.join(root, 'qm9_smiles.pkl')
+    # NOTE: if you change the vocabulary (e.g. adding/removing atom classes),
+    # delete qm9_vocab_cache.pkl so it regenerates with the new vocab.
     # Try to load from cache
-    if cache and os.path.exists(cache_path):
+    if cache and os.path.exists(cache_path) and os.path.exists(smiles_path):
         try:
             with open(cache_path, 'rb') as f:
                 cached = pickle.load(f)
                 print(f"Loaded vocabulary from cache: {cache_path}")
-                return (
-                    cached['enc2atom'],
-                    cached['atom2enc'],
-                    cached['max_N'],
-                    cached['class_weights']
-                )
+            
+            with open(smiles_path, 'rb') as f:
+                smiles = pickle.load(f)
+
+            return (
+                cached['enc2atom'],
+                cached['atom2enc'],
+                cached['max_N'],
+                cached['class_weights'],
+                smiles)
         except Exception as e:
             print(f"Failed to load cache ({e}), recomputing...")
     
     # Compute vocabulary
     print("Computing QM9 vocabulary...")
     enc2atom, atom2enc, max_N, class_weights = compute_qm9_vocabulary(dataset)
-    
+    smiles = load_qm9_smiles_from_dataset(dataset)
     # Save to cache
     if cache:
         try:
@@ -253,10 +259,11 @@ def get_qm9_vocabulary(
                     'class_weights': class_weights
                 }, f)
             print(f"Saved vocabulary to cache: {cache_path}")
+            with open(smiles_path, 'wb') as f:
+                pickle.dump(smiles, f)
         except Exception as e:
             print(f"Failed to save cache ({e})")
-    
-    return enc2atom, atom2enc, max_N, class_weights
+    return enc2atom, atom2enc, max_N, class_weights, smiles
 
 
 def compute_qm9_vocabulary(dataset: QM9) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
@@ -275,18 +282,27 @@ def compute_qm9_vocabulary(dataset: QM9) -> Tuple[torch.Tensor, torch.Tensor, in
     # QM9 real atomic numbers: H(1), C(6), N(7), O(8), F(9).
     # Padding is represented by z=0 in the collated tensor and must map to
     # an all-zero encoding so padded positions have no atom-type signal.
+    # Vocabulary includes a null/padding class at index 0 (atomic number 0).
+    # This is essential for generation: at inference time the model can signal
+    # "no atom here" by assigning high probability to class 0.  Without it,
+    # argmax always returns a real element and every slot is treated as occupied,
+    # making it impossible to generate molecules shorter than max_N.
     real_atomic_nums = [1, 6, 7, 8, 9]
-    vocab_size = len(real_atomic_nums)   # 5 — does NOT include padding
+    all_classes      = [0] + real_atomic_nums   # index 0 = null/padding
+    vocab_size       = len(all_classes)          # 6
 
-    # enc2atom: [vocab_size] — encoding index → atomic number (no padding entry)
-    enc2atom = torch.tensor(real_atomic_nums, dtype=torch.long)
+    # enc2atom: [vocab_size] — encoding index → atomic number
+    # Index 0 maps to atomic number 0 (null), so atom_nums != 0 correctly
+    # identifies real atoms after generation.
+    enc2atom = torch.tensor(all_classes, dtype=torch.long)
 
     # atom2enc: [max_atomic_num+1, vocab_size]
-    # Row 0 (padding) is all-zeros (default from torch.zeros).
-    # Rows for real atoms are one-hot.
+    # Each row is a one-hot encoding.  Atomic number 0 (padding) maps to
+    # class index 0, not to all-zeros, so the model has a concrete target
+    # to learn for padding positions.
     max_atomic_num = max(real_atomic_nums)
     atom2enc = torch.zeros((max_atomic_num + 1, vocab_size), dtype=torch.float32)
-    for enc_idx, atom_num in enumerate(real_atomic_nums):
+    for enc_idx, atom_num in enumerate(all_classes):
         atom2enc[atom_num, enc_idx] = 1.0
     
     # Compute max_N
@@ -304,7 +320,7 @@ def compute_qm9_vocabulary(dataset: QM9) -> Tuple[torch.Tensor, torch.Tensor, in
         4.18,   # F  (rare)
     ], dtype=torch.float32)
     
-    print(f"Vocabulary: {sorted(atomic_nums)}")
+    print(f"Vocabulary: {sorted(real_atomic_nums)}")
     print(f"Max atoms: {max_N}")
     print(f"Class weights: {class_weights}")
     

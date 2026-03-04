@@ -1,0 +1,111 @@
+I'll walk through the entire function from the moment get_reward() is called to the moment it returns, explaining every decision.
+
+Setup: What Comes In
+Every training step, SDPO generates two independent trajectories (mol1, mol2) through the diffusion process. From each trajectory, three snapshots are extracted: the start (the noisy initial state), the anchor (the most geometrically distinctive intermediate step, selected by the bimodal cosine similarity logic in SDPO.py), and the last (the final denoised molecule). These three snapshots are passed into get_reward() as mols = (start, anchor, last), where each element is a tuple of (coords [B, N, 3], atom_types [B, N, A]).
+The function returns a [3, B] tensor where rows are start/anchor/last and columns are batch samples. SDPO then uses this to compute advantages: R(last) - R(start) and R(last) - R(anchor), which are the signals that tell the model whether its trajectory improved the molecule or made it worse.
+
+Step 1: Stacking and Centering Coordinates
+pythoncoords_all = torch.stack((start[0], anchor[0], last[0]))   # [3, B, N, 3]
+atoms_all  = torch.stack((start[1], anchor[1], last[1]))   # [3, B, N, A]
+atoms_num  = vocab[atoms_all.argmax(-1, keepdim=True)]     # [3, B, N, 1]
+The three trajectory positions are stacked into a single [3, B, N, 3] tensor so all geometric reward computations can happen in one batched GPU call rather than three separate calls. atoms_all is a one-hot encoding; argmax converts it back to an index, which is then looked up in vocab to get the actual atomic number (1=H, 6=C, 7=N, 8=O, 9=F, 0=padding).
+pythonreal_f3d  = (atoms_num > 0).float()
+centroid  = (coords_all * real_f3d).sum(2, keepdim=True) / n_real_3
+coords_c  = (coords_all - centroid) * scale
+Padding atoms (atomic number 0) are masked out. The centroid of the real atoms is computed and subtracted so all molecules are centred at the origin — this makes distances meaningful regardless of where in the latent space the diffusion process placed them. The scale factor (2.2 by default) converts from the model's internal coordinate units to Angstroms, which is what all the physical constants (bond lengths, VdW radii) are calibrated to.
+
+Step 2: The Geometric Energy Reward (EnergyRewarder.compute)
+This is the core GPU computation. It takes [3, B, N, 3] coordinates and returns [3, B] rewards. Everything inside is fully vectorised — no Python loops over atoms or molecules.
+2a. Pairwise Distance Matrix
+pythondist_mat = torch.cdist(pos, pos)   # [M, B, N, N]
+Every atom-to-atom distance is computed simultaneously. This [3, B, 29, 29] tensor is the foundation of every subsequent calculation. torch.cdist uses a batched matrix multiplication internally, making it significantly faster than computing distances manually.
+The real_pair mask ensures that any term involving a padding atom is zeroed out. The off_diag mask further removes self-interactions (diagonal entries where i == j).
+2b. Per-Pair Physical Parameters
+pythonr0   = r0_i.unsqueeze(-1) + r0_i.unsqueeze(-2)   # [M, B, N, N] equilibrium bond length
+de   = (de_i.unsqueeze(-1) * de_i.unsqueeze(-2)).sqrt()  # geometric mean well depth
+sig  = (s_i.unsqueeze(-1) + s_i.unsqueeze(-2)) * 0.5     # arithmetic mean LJ sigma
+eps  = (e_i.unsqueeze(-1) * e_i.unsqueeze(-2)).sqrt()    # geometric mean LJ epsilon
+For every pair of atoms (i, j), the physical interaction parameters are assembled from per-element lookup tables. Equilibrium bond length is the sum of the two covalent radii — a C-N bond has equilibrium length 0.76 + 0.71 = 1.47 Å. The well depth and LJ parameters use combination rules borrowed from standard force fields (geometric mean for energy-like quantities, arithmetic mean for distance-like quantities). This happens for all N×N pairs simultaneously via broadcasting.
+2c. The Soft Bond Gate
+pythonr_thr  = r0 * _BOND_FAC                              # threshold = 1.15 × eq. length
+p_bond = torch.sigmoid((r_thr - dist_mat) / _BOND_T) # [M, B, N, N] ∈ [0, 1]
+This is the key architectural difference from v1/v2. Instead of a hard decision — "is this distance < threshold? yes/no" — p_bond is a continuous probability that pair (i,j) is bonded. At distances well below the threshold (very short, clearly bonded), p_bond ≈ 1. At distances well above the threshold (clearly not bonded), p_bond ≈ 0. In between, it transitions smoothly through a sigmoid.
+The temperature _BOND_T = 0.15 Å controls how sharp the transition is. At exactly the threshold distance, p_bond = 0.5. This single value implicitly defines "bonded" vs "non-bonded" for every subsequent term without a single if-statement.
+2d. Morse Potential (Bonded Pairs)
+pythonmorse_v = de * (1.0 - exp(-_MORSE_A * (dist_mat - r0))).pow(2)
+r_morse = -(morse_v * p_bond).sum((-2, -1)) / n_real
+The Morse potential is a physical model for a chemical bond's energy landscape. It has a few properties that make it ideal here:
+At r = r0 (equilibrium), exp(0) = 1, so (1 - 1)² = 0. The bond contributes zero penalty — this is the reward-maximising configuration.
+For r < r0 (compression), the exponential grows rapidly and the penalty rises steeply. Atoms forced too close together are strongly penalised.
+For r > r0 (stretching), the exponential decays toward zero, so the penalty approaches de asymptotically. Stretched bonds are penalised, but less harshly than compressed ones — which matches real physics (bonds can stretch more than they can compress before breaking).
+The p_bond weighting means the Morse term only fires on pairs that look bonded. For a pair at 5 Å (clearly not bonded), p_bond ≈ 0 and the Morse term contributes nothing regardless of how much morse_v itself evaluates to.
+2e. Lennard-Jones Potential (Non-Bonded Pairs)
+pythonsr6   = (sig / r_safe).pow(6)
+lj_v  = 4.0 * eps * (sr6.pow(2) - sr6)    # repulsion - attraction
+r_lj  = -(lj_v * nb_mask).sum((-2, -1)) / n_real
+Where Morse handles bonded pairs, Lennard-Jones handles everything else. The (σ/r)^12 term is the repulsive wall — it blows up very rapidly as atoms approach each other closer than their VdW radii. The -(σ/r)^6 term is the attractive van der Waals well — it provides a gentle pull that keeps non-bonded atoms at a reasonable distance from each other rather than flying apart.
+Together, these two terms replace three separate components from v1: the steric clash penalty (now handled by the r^12 term), the proximity pull reward (now the r^6 attractive term), and the radius of gyration penalty (now an emergent consequence of non-bonded attraction keeping the molecule compact).
+The nb_mask = (1 - p_bond) * off_diag ensures LJ only applies to non-bonded pairs. A bonded pair already has its interaction handled by Morse; applying LJ to it as well would double-count.
+2f. Soft Angle Bending
+python_, nbr_idx = p_bond.topk(K_nbr, dim=-1)   # top-4 most-bonded neighbours per atom
+nbr_pos    = gather(pos, nbr_idx)          # positions of those neighbours
+v_norm     = normalize(nbr_pos - pos)     # unit vectors toward each neighbour
+cos_ang    = einsum('...id,...jd->...ij', v_norm, v_norm)   # all pairwise dot products
+theta      = acos(cos_ang)               # actual angles
+gate       = nbr_pb_i * nbr_pb_j        # soft gate: both bonds must be real
+r_angle    = -K_angle * (theta - 109.5°)² * gate
+This is the most chemically meaningful term and the only one that v1/v2 completely lacked. Pure pairwise potentials (Morse + LJ) cannot encode molecular geometry — they say nothing about whether a carbon atom should be tetrahedral or whether a nitrogen should be planar.
+The angle bending term works as follows. For each atom, the four atoms with highest bond probability are identified as neighbours. For every pair of those neighbours (i.e., every angle i–central–j), the actual angle is compared to the ideal tetrahedral angle of 109.5°. Deviation is penalised quadratically — the same form used in classical molecular mechanics force fields.
+The gate = p_bond_ij × p_bond_kj ensures the angle penalty only fires if both legs of the angle (central-to-i and central-to-j) are actually bonded. If either bond probability is near zero, the entire angle term is suppressed. This means atoms that are truly isolated or fragments don't accumulate spurious angle penalties.
+One simplification: the ideal angle is set to 109.5° (sp3 tetrahedral) for all atoms. A more precise version would detect hybridisation (sp2 for planar atoms like aromatic carbons, sp for linear ones) and use different ideals. This would require inferring bond order from the geometry — feasible but significantly more complex.
+2g. Algebraic Connectivity (Fiedler Proxy)
+pythondegree    = p_bond.sum(-1)        # effective bond count per atom
+d_min     = degree.min(-1)        # minimum degree across all real atoms
+d_max     = degree.max(-1)        # maximum degree
+r_connect = K_connect * (d_min / d_max)   # ∈ [0, 1] → [0, 2]
+This replaces the fragment detection from v1/v2, which worked by counting disconnected components — a discrete operation requiring graph traversal. Instead, connectivity is measured continuously using the ratio of minimum to maximum atom degree in the soft bond graph.
+For a fully connected molecule, every atom has at least one bond, so d_min > 0 and the ratio is somewhere in (0, 1]. For a fragmented molecule with isolated atoms, those atoms have zero bond probability to anyone, so d_min = 0 and the ratio collapses to zero. The reward for connectivity is therefore K_connect × ratio, which is positive for connected structures and zero for fragments.
+This is an approximation of the true Fiedler value (second-smallest eigenvalue of the graph Laplacian, which equals zero if and only if the graph is disconnected). The eigenvalue computation would require a full SVD on the [M, B, N, N] Laplacian matrix — expensive. The degree ratio gives most of the same signal at a fraction of the cost.
+2h. Valence Satisfaction
+pythoneff_val   = p_bond.sum(-1)                      # effective bond count (soft)
+excess    = (eff_val - target_valence).clamp(0) # only penalise over-bonded atoms
+r_val     = -(excess² * real_f).sum(-1) / n_real
+Each element has a standard valence: H=1, C=4, N=3, O=2, F=1. The effective bond count is the sum of all bond probabilities for that atom — if an atom has p_bond = 0.9 to one neighbour and p_bond = 0.7 to another, its effective valence is 1.6.
+Only excess valence is penalised (quadratically). Under-bonded atoms are not penalised here because isolated atoms are already handled by the connectivity term, and partial bonding during early training shouldn't be aggressively punished. A carbon that only has 2 bonds formed so far isn't wrong — it might form 2 more. A carbon with 6 bonds is definitely wrong.
+2i. Atom Count
+pythondeficit = (9.0 - n_real).clamp(0)
+surplus = (n_real - 10.8).clamp(0)
+r_atom  = -3.0 × deficit - 3.0 × surplus
+QM9 molecules have a mean of 9 heavy atoms. If the model generates fewer, it gets a linear penalty proportional to the shortfall. If it generates more than 10.8 (the threshold is 1.2 × 9), it gets an equally strong penalty. Both penalties use the same weight (3.0), making the atom count target symmetric.
+This was asymmetric in v1 (3× for deficit, 1× for surplus) which contributed to the model generating increasingly heavy molecules — the surplus penalty was too weak to counteract the model's tendency toward larger structures. Equalising both directions is what brought MW down from 440 Da to 190 Da in the last run.
+
+Step 3: Buffer Update from All Three Positions
+pythonfor m in range(3):
+    fps_m = rewarder.buffer.fingerprint(coords_c[m], real_mask_3[m])
+    rewarder.buffer.update(fps_m)
+After computing geometric rewards, each of the three trajectory positions is fingerprinted and added to the repulsion buffer. The fingerprint is a soft distance histogram — for every pair of real atoms, their distance is converted to a Gaussian kernel over 64 bins covering 0–12 Å, then summed and normalised by the number of pairs. The result is a 64-dimensional vector that uniquely characterises the molecule's spatial structure and is invariant to rotation, translation, and atom permutation.
+This fingerprint is then passed to buffer.update(). If distributed training is active, dist.all_gather collects fingerprints from all GPU ranks before inserting them, so every rank's buffer reflects the global distribution of generated molecules.
+The critical fix here is the for m in range(3) loop. Previously only last (m=2) was added. After ~8 steps at batch_size=60, the buffer was full of end-of-trajectory molecules. Querying diversity against that buffer gave last low scores (similar to what's in the buffer) while start got high scores (different from the buffer, which contains no start structures). This inverted the ordering. Now all three positions are added equally, so diversity pressure is symmetric.
+
+Step 4: Diversity Reward (Flat, Same for All Three)
+pythonfor m in range(3):
+    fps_m = rewarder.buffer.fingerprint(coords_c[m], real_mask_3[m])
+    div   = rewarder.buffer.diversity_reward(fps_m, w=w_diversity * _DIV_W_FLAT)
+    rewards[m] += div
+Each molecule's fingerprint is compared against all entries in the buffer using cosine dissimilarity: 1 - cos(fps, buffer_entry). The mean dissimilarity across all buffer entries is the diversity score. A molecule very similar to many recent molecules scores near 0; a genuinely novel structure scores near 1.
+The weight _DIV_W_FLAT = 1.0 is the same for all three positions. This is intentional and is the second critical fix. Previously diversity used the progressive weights [0.5, 0.75, 1.0] — which meant last got 2× the diversity pressure of start. Since the buffer was also only updated from last, this created a compounding disadvantage for last. Flattening the weight removes diversity from the SDPO ranking signal entirely. It becomes a pure novelty bonus that lifts all three molecules equally when they're novel and penalises all three equally when they're repetitive.
+
+Step 5: RDKit Validity and Quality Bonus (Progressive, Intentionally Asymmetric)
+pythonfor m, (mol_pair, w_rdkit) in enumerate(zip([start, anchor, last], [0.5, 0.75, 1.0])):
+    val = _rdkit_validity_batch(mol_pair[0], mol_pair[1], vocab, ...)
+    rewards[m] += w_rdkit * val
+This is the only asymmetric component, and it's asymmetric by design. Three RDKit evaluations run in parallel via the thread pool, one per trajectory position. For each molecule, the coordinates are centred and scaled to Angstroms, atoms are assembled into an RDKit molecule object, connectivity is determined, and then:
+If fewer than 2 real atoms: returns -2 × w_valid. This is a strong penalty to prevent the model from exploiting near-empty molecules.
+If RDKit parsing fails (invalid geometry): returns -0.5 × w_valid. Partial penalty because the geometry might be close to valid.
+If multiple fragments: returns 0.2 × w_valid. Low but positive, because at least some structure was generated.
+If a single connected molecule: returns 2.0 × w_valid, plus a quality bonus: 0.5 × (0.7 × QED + 0.3 × MW_score). QED (Quantitative Estimate of Drug-likeness) scores from 0 to 1 based on eight physicochemical descriptors. MW_score is a Gaussian centred at 130 Da with width 80 Da — it is 1.0 for molecules near the QM9 mean weight and falls smoothly to zero outside the plausible range.
+The progressive weights [0.5, 0.75, 1.0] mean last gets twice the validity/quality signal as start. This is the mechanism that makes R(last) > R(start) in expectation — the final denoised molecule is more strongly rewarded for being chemically valid than the noisy intermediate structures are. This ordering is what SDPO needs to create a meaningful advantage signal.
+
+What the Output Looks Like
+The returned [3, B] tensor has three meaningful components at each cell: the geometric energy (large negative early in training, approaching zero as molecules become physically reasonable), the diversity bonus (zero until the buffer fills, then ~0 to 2.0), and the RDKit validity bonus (negative for invalid molecules, up to ~3.0 for valid high-QED structures).
+In a healthy run, you should see rewards[2] > rewards[1] > rewards[0] (last > anchor > start) consistently from around step 100 onward, with the gap between last and start growing as the model learns to improve its trajectories. The absolute values will drift upward from around -50 toward -5 to +5 as the energy landscape becomes satisfied. The diversity bonus will switch on at around step 100 (when the buffer is 1/3 full) and stabilise after step 300 (when it's full), adding roughly 0.5 to 1.5 to all three positions simultaneously without disturbing their relative ordering.

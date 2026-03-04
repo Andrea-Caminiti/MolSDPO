@@ -1,5 +1,5 @@
-MolSDP/*
-MolSDP.egg-info
+MolSDPO/*
+MolSDPO.egg-info/
 __pycache__/
 QM9/
 checkpoints/

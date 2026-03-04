@@ -1,489 +1,695 @@
 """
-reward.py
-=========
-Multi-objective reward for SDPO molecular diffusion, targeting PoseBusters
-compliance and drug-likeness.
+RL/reward.py
 
-Design
+3D-aware multi-objective reward for the Tabasco diffusion pipeline.
+
+Inputs
 ------
-Three reward components, ordered by their role:
+coords     : torch.Tensor [B, N, 3]   — 3D atom positions (Å)
+atom_types : torch.Tensor [B, N, A]   — one-hot / logit atom-type vectors
+vocab      : dict[int, str]           — encoded index → element symbol (e.g. {0: 'C', 1: 'N'})
 
-1. Geometry  (all six terms restored, reweighted)
-   Directly maps to PoseBusters checks:
-     Morse       → bond lengths within CSD distribution
-     LJ          → no steric clashes (< 0.75× VDW radii)
-     Angle       → bond angles in acceptable ranges / ring planarity
-     Connectivity → single connected fragment
-     Valence     → no over-bonded atoms
-     Atom count  → molecule size on-target
-
-2. Validity  (RDKit single-fragment check)
-   Binary-ish gate: clear +2 for connected mol, penalty for empty.
-
-3. Mol-props  (QED + SA, weight=4.0)
-   Primary inter-trajectory discriminating signal for SDPO's win-rate ranking.
-   QED and SA naturally vary across rollout trajectories; geometry terms do not
-   (all valid molecules have similar force-field energy). High prop_weight keeps
-   the ranking signal strong without removing structural constraints.
-
-What was removed vs the previous version
------------------------------------------
-* StructuralDiversityTracker / RepulsionBuffer / _intra_batch_uniqueness
-  Buffer-based diversity penalised the best trajectories for resembling
-  previous best outputs — directly inverting SDPO's ranking signal.
-  Within-rollout diversity is handled implicitly: if all 32 trajectories
-  collapse to the same molecule every win_rate is 0.5 and the loss gets
-  zero gradient, which is the correct behaviour.
-
-* Progressive validity weights [0.5, 0.75, 1.0]
-  Scaled all 32 trajectories identically at each position — affected
-  R(start) vs R(last) but not R(traj_i) vs R(traj_j), which is what
-  SDPO cares about.
-
-* KL novelty against dataset reference
-  sigmoid(KL(generated || QM9)) rewarded molecules unlike known drug-like
-  molecules — the opposite of the intended objective.
-
-Returns
+Outputs
 -------
-torch.Tensor  shape [3, B]
-    Row 0 = start, row 1 = anchor, row 2 = last.
-    Flat weights across all three positions. SDPO's interp_rewards handles
-    position weighting; this function has no opinion about positions.
+scalar reward per molecule: torch.Tensor [B]
+
+Sub-rewards
+-----------
+1. GeometricReward      — bond-length and bond-angle Z-scores vs. ideal values.
+                          Fully vectorized tensor computation: no RDKit, no .item()
+                          calls, works for every rollout.
+2. BondDeviationReward  — mean absolute deviation of all bond lengths from their
+                          ideal values, normalized to [0, 1].  Pure tensor ops,
+                          no subprocess, no conformer generation.
+                          Replaces StrainReward (MMFF94 + ETKDGv3), which called
+                          AllChem.EmbedMolecule on every molecule — ignoring the
+                          model's own 3D coordinates and taking ~50-200 ms each.
+3. ChemicalReward       — QED, SA score, logP range, MW — all from RDKit.
+                          Only computed when sanitization succeeds; zero otherwise.
+4. ValidityReward       — Binary: did RDKit sanitize successfully?
+                          Ensures the model always gets a gradient signal even
+                          when chemical properties cannot be computed.
+
+StrainReward is retained in this file for use in score.py (offline evaluation),
+where per-step cost does not matter.  It must NOT be used during training.
+
+Combination: uncertainty / homoscedastic weighting (Kendall et al., 2018)
+--------------------------------------------------------------------------
+    total_reward = Σ_i  (1 / 2σ_i²) * sub_i  −  Σ_i log(σ_i)
+
+where log(σ_i²) are *learned* scalar parameters (one per sub-reward).
+High-σ tasks are down-weighted automatically; the log term prevents σ → ∞.
+AdaptiveWeighter is an nn.Module — add it to your optimizer (see bottom of file).
+
+Integration with train.py
+-------------------------
+In LightningTabascoPipe.__init__:
+    self.rewarder = MoleculeRewarder(vocab)          # replaces EnergyRewarder
+    self.weighter = AdaptiveWeighter(n_objectives=4) # add to model
+
+In configure_optimizers, include self.weighter.parameters() alongside the
+model's trainable heads.
+
+In _compute_advantages, call:
+    r_final = self.rewarder(coords, atom_types, self.weighter)  # [G, B]
 """
 
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
-from mol_builder import build_mols_from_pipeline_output
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors, QED, rdMolDescriptors
+from rdkit.Chem.rdForceFieldHelpers import MMFFGetMoleculeForceField, MMFFHasAllMoleculeParams
 
-# ── RDKit ─────────────────────────────────────────────────────────────────────
+# ── SA score — import once at module level, never inside hot loops ────────────
+# _compute_sa_score was importing sascorer on every call (1,152×/step).
+# Module-level import pays the cost exactly once at startup.
+_sascorer = None
 try:
-    from rdkit import Chem, RDLogger
-    from rdkit.Chem import Descriptors, QED
-    RDLogger.DisableLog('rdApp.*')
-    _RDKIT_OK = True
-except ImportError:
-    warnings.warn("RDKit not found – validity / mol-prop rewards disabled.")
-    _RDKIT_OK = False
-
-# ── SA Score ──────────────────────────────────────────────────────────────────
-try:
-    from sascorer import calculateScore as _sa_score_fn
-    _SA_OK = True
+    from rdkit.Contrib.SA_Score import sascorer as _sascorer
 except ImportError:
     try:
-        from rdkit.Contrib.SA_Score import sascorer as _sa_mod
-        _sa_score_fn = _sa_mod.calculateScore
-        _SA_OK = True
-    except Exception:
-        _SA_OK = False
-        warnings.warn("SAScore not available – will be skipped.")
+        import sascorer as _sascorer   # alternate install path
+    except ImportError:
+        pass   # _sascorer stays None; _compute_sa_score returns neutral 5.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Physical constants  (all distances in Ångströms)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Ideal geometry reference tables ──────────────────────────────────────────
+# Bond lengths in Å (canonical single-bond values; we use these as the prior
+# mean and penalise deviations with a soft Z-score rather than a hard cutoff).
 
-_MAX_Z = 10
-
-# index = atomic number, 0 = padding
-_R_COV = torch.tensor([0.00, 0.31, 0.76, 0.71, 0.66, 0.57,
-                        0.77, 0.77, 0.77, 0.77, 0.77])   # covalent radii
-_D_E   = torch.tensor([0.00, 0.40, 0.90, 0.85, 0.80, 0.70,
-                        0.80, 0.80, 0.80, 0.80, 0.80])   # Morse well depth
-_LJ_S  = torch.tensor([0.00, 1.20, 1.70, 1.55, 1.52, 1.47,
-                        1.50, 1.50, 1.50, 1.50, 1.50])   # LJ sigma (VDW radii)
-_LJ_E  = torch.tensor([0.00, 0.04, 0.09, 0.08, 0.08, 0.07,
-                        0.08, 0.08, 0.08, 0.08, 0.08])   # LJ epsilon
-_VAL   = torch.tensor([0.0,  1.0,  4.0,  3.0,  2.0,  1.0,
-                        4.0,  4.0,  4.0,  4.0,  4.0])    # expected valence
-
-_MORSE_A         = 2.0
-_BOND_T          = 0.15              # sigmoid temperature (Å)
-_BOND_FAC        = 1.15              # bond threshold multiplier
-_IDEAL_ANGLE_SP3 = math.radians(109.5)
-_N_TARGET        = 9.0
-_N_THRESH        = _N_TARGET * 1.2
-
-# ── Geometry term weights ─────────────────────────────────────────────────────
-# Rebalanced so no single term dominates the geometry score.
-# Connectivity and valence kept highest — most discriminating and most directly
-# tested by PoseBusters.
-_W_MORSE   = 0.5   # bond length proxy         → PoseBusters bond length check
-_W_LJ      = 0.5   # steric clash avoidance    → PoseBusters clash check
-_W_ANGLE   = 0.3   # sp3/sp2 geometry          → PoseBusters angle check
-_W_CONNECT = 1.0   # Fiedler connectivity      → single fragment requirement
-_W_VAL     = 1.5   # valence satisfaction      → no over-bonded atoms
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  EnergyRewarder
-# ─────────────────────────────────────────────────────────────────────────────
-
-class EnergyRewarder:
-    """
-    Six-term differentiable force-field reward.  All operations stay on-device.
-
-    Term → PoseBusters check mapping:
-      Morse        → bond lengths within CSD mean ± 3σ
-      LJ           → no internal steric clashes (< 0.75 × VDW radii)
-      Angle        → bond angles and ring planarity within acceptable ranges
-      Connectivity → molecule is a single connected fragment
-      Valence      → no over-bonded atoms
-      Atom count   → molecule size near target
-    """
-
-    def __init__(self, device: str = "cuda", batch_size: int = 128):
-        self.device = device
-        self.r_cov  = _R_COV.to(device)
-        self.d_e    = _D_E.to(device)
-        self.lj_s   = _LJ_S.to(device)
-        self.lj_e   = _LJ_E.to(device)
-        self.val    = _VAL.to(device)
-        self._eye_N = -1
-        self._eye   = None
-
-    def initialize_from_dataset(self, train_dataset):
-        """No-op — kept for API compatibility."""
-        pass
-
-    def _eye_mask(self, N: int) -> torch.Tensor:
-        if N != self._eye_N:
-            self._eye_N = N
-            self._eye   = torch.eye(N, dtype=torch.bool, device=self.device)
-        return self._eye
-
-    @torch.no_grad()
-    def compute(
-        self,
-        pos   : torch.Tensor,   # [M, B, N, 3]  pre-centred Ångströms
-        atom_z: torch.Tensor,   # [M, B, N, 1]  atomic numbers (0 = pad)
-    ) -> torch.Tensor:          # [M, B]
-        M, B, N, _ = pos.shape
-        eye        = self._eye_mask(N)
-
-        z      = atom_z.squeeze(-1).long().clamp(0, _MAX_Z)
-        real   = z > 0
-        real_f = real.float()
-        n_real = real_f.sum(-1).clamp(min=1.0)               # [M, B]
-
-        dist_mat  = torch.cdist(pos, pos)                     # [M, B, N, N]
-        real_pair = real.unsqueeze(-1) & real.unsqueeze(-2)
-        off_diag  = real_pair & ~eye
-
-        r0_i = self.r_cov[z]
-        r0   = r0_i.unsqueeze(-1) + r0_i.unsqueeze(-2)       # [M, B, N, N]
-        de   = (self.d_e[z].unsqueeze(-1)  * self.d_e[z].unsqueeze(-2)).sqrt()
-        sig  = (self.lj_s[z].unsqueeze(-1) + self.lj_s[z].unsqueeze(-2)) * 0.5
-        eps  = (self.lj_e[z].unsqueeze(-1) * self.lj_e[z].unsqueeze(-2)).sqrt()
-
-        r_thr  = r0 * _BOND_FAC
-        p_bond = torch.sigmoid((r_thr - dist_mat) / _BOND_T) * off_diag.float()
-
-        # 1. Morse  — bond length proxy
-        #    Penalises bonds deviating from equilibrium r0.
-        #    → PoseBusters: bond lengths within CSD mean ± 3σ
-        morse_v = de * (1.0 - torch.exp(-_MORSE_A * (dist_mat - r0))).pow(2)
-        r_morse = -(morse_v * p_bond).sum((-2, -1)) / n_real
-
-        # 2. Lennard-Jones  — steric clash avoidance
-        #    Repulsive wall for non-bonded pairs below VDW contact distance.
-        #    → PoseBusters: no internal steric clashes
-        sr6  = (sig / dist_mat.clamp(min=0.5)).pow(6)
-        lj_v = 4.0 * eps * (sr6.pow(2) - sr6)
-        r_lj = -(lj_v * (1.0 - p_bond) * off_diag.float()).sum((-2, -1)) / n_real
-
-        # 3. Soft angle bending  — sp3 geometry preference
-        #    Penalises bonded triplets deviating from tetrahedral angle.
-        #    → PoseBusters: bond angles within acceptable ranges
-        K_nbr      = min(4, N - 1)
-        _, nbr_idx = p_bond.topk(K_nbr, dim=-1)
-        nbr_pos    = torch.gather(
-            pos.unsqueeze(3).expand(M, B, N, N, 3),
-            3,
-            nbr_idx.unsqueeze(-1).expand(M, B, N, K_nbr, 3),
-        )
-        nbr_pb  = torch.gather(p_bond, -1, nbr_idx)
-        v_norm  = F.normalize(nbr_pos - pos.unsqueeze(-2), dim=-1, eps=1e-8)
-        cos_ang = torch.einsum('...id,...jd->...ij', v_norm, v_norm).clamp(-1 + 1e-6, 1 - 1e-6)
-        theta   = torch.acos(cos_ang)
-        gate    = nbr_pb.unsqueeze(-1) * nbr_pb.unsqueeze(-2)
-        r_angle = -(_W_ANGLE * (theta - _IDEAL_ANGLE_SP3).pow(2) * gate).sum((-3, -2, -1)) / n_real
-
-        # 4. Algebraic connectivity proxy (Fiedler)
-        #    Soft min-degree / max-degree ratio. Drops sharply for fragments.
-        #    → PoseBusters: single connected fragment
-        degree    = p_bond.sum(-1)
-        d_real    = degree * real_f
-        r_connect = _W_CONNECT * (
-            d_real.min(-1).values.clamp(min=0.0) /
-            d_real.max(-1).values.clamp(min=1e-6)
-        )
-
-        # 5. Valence satisfaction
-        #    Continuous penalty for atoms bonded beyond expected valence.
-        #    → PoseBusters: no impossible valences
-        val_excess = (p_bond.sum(-1) - self.val[z]).clamp(min=0.0)
-        r_val      = -_W_VAL * (val_excess.pow(2) * real_f).sum(-1) / n_real
-
-
-        return r_morse + r_lj + r_angle + r_connect + r_val
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Molecular-property registry
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class PropSpec:
-    fn       : Callable   # RDKit Mol -> float  (nan on failure)
-    direction: int        # +1 = higher better, -1 = lower better
-    lo       : float
-    hi       : float
-    weight   : float = 1.0
-
-
-def _safe(fn: Callable) -> Callable:
-    def _wrapped(mol):
-        try:
-            return float(fn(mol))
-        except Exception:
-            return float("nan")
-    return _wrapped
-
-
-def _sascore_normalised(mol) -> float:
-    if not _SA_OK:
-        return float("nan")
-    try:
-        if Chem.SanitizeMol(mol, catchErrors=True) != 0:
-            return 0.0
-    except Exception:
-        return 0.0
-    raw = _sa_score_fn(mol)     # 1 (easy) – 10 (hard)
-    return (10.0 - raw) / 9.0  # → [0, 1], higher = easier to synthesise
-
-
-DEFAULT_PROP_SPECS: Dict[str, PropSpec] = {
-    "qed":     PropSpec(_safe(QED.qed if _RDKIT_OK else lambda m: float("nan")),
-                        +1, 0.0,   1.0,   1.0),
-    "sascore": PropSpec(_safe(_sascore_normalised),
-                        +1, 0.0,   1.0,   1.0),
-    "logp":    PropSpec(_safe(Descriptors.MolLogP if _RDKIT_OK else lambda m: float("nan")),
-                        +1, -3.0,  5.0,   0.5),
-    "mw":      PropSpec(_safe(Descriptors.MolWt if _RDKIT_OK else lambda m: float("nan")),
-                        -1, 200.0, 600.0, 0.3),
+_BOND_LENGTH_IDEAL: Dict[Tuple[str, str], float] = {
+    ('C', 'C'): 1.54, ('C', 'N'): 1.47, ('C', 'O'): 1.43,
+    ('C', 'S'): 1.82, ('C', 'H'): 1.09, ('C', 'F'): 1.35,
+    ('C', 'Cl'): 1.77, ('C', 'Br'): 1.94, ('N', 'N'): 1.45,
+    ('N', 'O'): 1.40, ('N', 'H'): 1.01, ('O', 'H'): 0.96,
+    ('S', 'S'): 2.05, ('S', 'H'): 1.34,
 }
+_BOND_TOLERANCE: float = 0.25    # Å — soft σ for the Z-score penalty
+_BOND_MAX_DIST:  float = 1.9     # Å — beyond this we do not consider a bond
+
+# Ideal sp3 tetrahedral and sp2 planar angles
+_IDEAL_ANGLE_SP3: float = 109.5  # degrees
+_IDEAL_ANGLE_SP2: float = 120.0
+_ANGLE_TOLERANCE: float = 15.0   # degrees — σ for the angle Z-score penalty
 
 
-def register_property(
-    name: str, fn: Callable, direction: int,
-    lo: float, hi: float, weight: float = 1.0,
-) -> None:
-    """Add a custom property to the global registry."""
-    DEFAULT_PROP_SPECS[name] = PropSpec(
-        fn=_safe(fn), direction=direction, lo=lo, hi=hi, weight=weight
-    )
+def _lookup_ideal_bond(elem_i: str, elem_j: str) -> float:
+    """Return ideal bond length for an element pair, defaulting to 1.54 Å."""
+    key  = (elem_i, elem_j)
+    rkey = (elem_j, elem_i)
+    return _BOND_LENGTH_IDEAL.get(key, _BOND_LENGTH_IDEAL.get(rkey, 1.54))
 
 
-def _normalise_prop(values: np.ndarray, spec: PropSpec) -> np.ndarray:
-    v      = np.clip(values, spec.lo, spec.hi)
-    span   = spec.hi - spec.lo
-    normed = np.zeros_like(v) if span == 0 else (v - spec.lo) / span
-    return 1.0 - normed if spec.direction == -1 else normed
+# ── Coords → RDKit molecule ───────────────────────────────────────────────────
+
+def build_rdkit_mol(
+    coords     : torch.Tensor,   # [N, 3]
+    atom_elems : List[str],      # length N
+) -> Optional[Chem.Mol]:
+    """
+    Construct an RDKit Mol from 3D coordinates and element symbols.
+
+    Strategy:
+      1. Place atoms at given positions.
+      2. Use RDKit's DetermineBonds (distance + valence) to infer connectivity.
+      3. Sanitize; return None on failure so the caller can fall back gracefully.
+    """
+    try:
+        rw = Chem.RWMol()
+        conf = Chem.Conformer(len(atom_elems))
+
+        for i, elem in enumerate(atom_elems):
+            idx = rw.AddAtom(Chem.Atom(elem))
+            pos = coords[i].tolist()
+            conf.SetAtomPosition(idx, pos)
+
+        rw.AddConformer(conf, assignId=True)
+
+        # Infer bonds from 3D geometry + element valence rules
+        AllChem.DetermineBonds(rw, charge=0)
+        Chem.SanitizeMol(rw)
+        return rw.GetMol()
+    except Exception:
+        return None
 
 
-def _prop_scores(
-    rdmols: List,
-    specs : Dict[str, PropSpec],
-    active: List[str],
-) -> np.ndarray:
-    """Weighted normalised property scores. Shape: (B,)."""
-    n = len(rdmols)
-    if not _RDKIT_OK or not active:
-        return np.zeros(n, dtype=np.float32)
-
-    weighted_sum = np.zeros(n, dtype=np.float32)
-    total_weight = 0.0
-    for name in active:
-        spec = specs.get(name)
-        if spec is None:
-            warnings.warn(f"Property '{name}' not in registry — skipped.")
-            continue
-        raw    = np.array(
-            [spec.fn(m) if m is not None else float("nan") for m in rdmols],
-            dtype=np.float32,
-        )
-        normed = _normalise_prop(raw, spec)
-        weighted_sum += spec.weight * np.where(np.isnan(normed), 0.0, normed)
-        total_weight += spec.weight
-
-    return weighted_sum / total_weight if total_weight > 0 else weighted_sum
+def decode_atom_types(
+    atom_types : torch.Tensor,   # [N, A]
+    vocab      : Dict[int, str],
+) -> List[str]:
+    """
+    Convert one-hot / logit atom-type tensor → list of element strings.
+    Absorb / padding tokens (indices not in vocab) are mapped to 'C' as a
+    safe fallback so that geometry can still be evaluated.
+    """
+    indices = atom_types.argmax(dim=-1).tolist()   # [N]
+    return vocab[indices].tolist()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  RewardConfig
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Sub-reward 1: Geometric validity ─────────────────────────────────────────
+
+# Pre-built ideal-length tensor, indexed by element-pair string.
+# Looked up once per batch via _build_ideal_dist_matrix; never inside a loop.
+def _build_ideal_dist_matrix(elems: List[str], device: torch.device) -> torch.Tensor:
+    """
+    Build an [N, N] tensor of ideal bond lengths for every atom pair.
+    Off-bond pairs (distance > _BOND_MAX_DIST) will be masked out later.
+    """
+    N = len(elems)
+    mat = torch.full((N, N), 1.54, dtype=torch.float, device=device)
+    for i in range(N):
+        for j in range(i + 1, N):
+            v = _lookup_ideal_bond(elems[i], elems[j])
+            mat[i, j] = v
+            mat[j, i] = v
+    return mat
+
+
+class GeometricReward:
+    """
+    Score 3D geometry quality from raw tensors — no RDKit required.
+
+    Bond-length score
+    -----------------
+    For every pair (i, j) with distance < _BOND_MAX_DIST, compute
+        z = (d_ij − d_ideal) / _BOND_TOLERANCE
+    and score with exp(−z²/2) (Gaussian kernel; 1.0 = perfect).
+
+    Angle score
+    -----------
+    For each bonded centre B with ≥2 neighbours, compute all A–B–C angles
+    and score deviation from the nearest ideal (sp3=109.5° or sp2=120°).
+
+    Both scores are computed with fully batched tensor ops — no Python loops
+    over atoms or pairs, no .item() calls during scoring.  The only remaining
+    Python loop is over the batch dimension B, which is necessary because
+    each molecule can have a different element composition and therefore a
+    different ideal-distance matrix.
+
+    Returns a scalar in (0, 1] per molecule.
+    """
+
+    def __call__(
+        self,
+        coords     : torch.Tensor,   # [B, N, 3]
+        atom_types : torch.Tensor,   # [B, N, A]
+        vocab      : Dict[int, str],
+    ) -> torch.Tensor:               # [B]
+        B = coords.shape[0]
+        scores = [
+            self._score_one(coords[b], decode_atom_types(atom_types[b], vocab))
+            for b in range(B)
+        ]
+        return torch.stack(scores).to(coords.device)
+
+    def _score_one(
+        self,
+        coords : torch.Tensor,   # [N, 3]
+        elems  : List[str],
+    ) -> torch.Tensor:           # scalar
+        N      = coords.shape[0]
+        device = coords.device
+
+        if N < 2:
+            return coords.new_tensor(1.0)
+
+        # ── Pairwise distances ────────────────────────────────────────────────
+        # diff: [N, N, 3];  dists: [N, N]
+        diff  = coords.unsqueeze(1) - coords.unsqueeze(0)
+        dists = diff.norm(dim=-1)
+
+        # ── Bond mask: pairs closer than _BOND_MAX_DIST (upper triangle only) ─
+        upper = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
+        bond_mask = upper & (dists < _BOND_MAX_DIST)   # [N, N]
+
+        # ── Bond-length score (fully vectorized) ─────────────────────────────
+        # Build the ideal-distance matrix once per molecule (small N≤29 Python
+        # loop — cheap compared to the per-pair loop it replaces).
+        d_ideal = _build_ideal_dist_matrix(elems, device)          # [N, N]
+        z_bond  = (dists - d_ideal) / _BOND_TOLERANCE              # [N, N]
+        bond_scores_mat = torch.exp(-0.5 * z_bond ** 2)            # [N, N]
+
+        bond_vals = bond_scores_mat[bond_mask]   # [n_bonds]
+
+        # ── Angle score (vectorized over triplets) ────────────────────────────
+        # bonded[i, j] = True if atoms i and j are bonded
+        bonded = bond_mask | bond_mask.T                            # [N, N] symmetric
+
+        # For each centre B: gather all (A, B, C) triplets where A≠C, both bonded to B.
+        # Strategy: build neighbour vectors for every (centre, neighbour) pair,
+        # then take all pairs of neighbour vectors for the same centre.
+
+        # neighbour_mask[b, n] = True if n is a neighbour of b (b ≠ n)
+        neighbour_mask = bonded & ~torch.eye(N, dtype=torch.bool, device=device)  # [N, N]
+
+        angle_scores_list = []
+        for centre in range(N):
+            nb = neighbour_mask[centre].nonzero(as_tuple=False).squeeze(-1)  # [deg]
+            deg = nb.shape[0]
+            if deg < 2:
+                continue
+
+            b_pos  = coords[centre]                    # [3]
+            nb_pos = coords[nb]                        # [deg, 3]
+            vecs   = nb_pos - b_pos.unsqueeze(0)       # [deg, 3]
+            vecs   = F.normalize(vecs, dim=-1)         # [deg, 3]
+
+            # All pairs of neighbour vectors: [deg, deg] cosine similarity matrix
+            cos_mat  = torch.clamp(vecs @ vecs.T, -1.0, 1.0)      # [deg, deg]
+            # Upper-triangle pairs only (avoid double-counting and self-pairs)
+            tri_mask = torch.triu(
+                torch.ones(deg, deg, dtype=torch.bool, device=device), diagonal=1
+            )
+            cos_vals = cos_mat[tri_mask]               # [n_angles]
+
+            angles_rad = torch.acos(cos_vals)          # [n_angles]
+            angles_deg = angles_rad * (180.0 / math.pi)
+
+            # Score against nearest ideal (sp3 or sp2) — all tensor, no Python loop
+            d_sp3 = (angles_deg - _IDEAL_ANGLE_SP3).abs()
+            d_sp2 = (angles_deg - _IDEAL_ANGLE_SP2).abs()
+            best  = torch.minimum(d_sp3, d_sp2)       # [n_angles]
+            z_ang = best / _ANGLE_TOLERANCE
+            angle_scores_list.append(torch.exp(-0.5 * z_ang ** 2))
+
+        # ── Combine bond + angle scores ───────────────────────────────────────
+        parts = [bond_vals]
+        if angle_scores_list:
+            parts.append(torch.cat(angle_scores_list))
+        all_scores = torch.cat(parts)
+
+        return all_scores.mean() if all_scores.numel() > 0 else coords.new_tensor(1.0)
+
+
+# ── Sub-reward 2: Bond-deviation strain proxy ─────────────────────────────────
+
+class BondDeviationReward:
+    """
+    Fast geometry-based strain proxy using the model's own 3D coordinates.
+
+    For every bonded pair (distance < _BOND_MAX_DIST), compute the absolute
+    deviation from the ideal bond length and average across all bonds:
+
+        mean_dev = mean |d_ij − d_ideal_ij|   (Å)
+        reward   = exp(−mean_dev / scale)       scale = 0.2 Å
+
+    This is entirely equivalent to the bond-length component of GeometricReward
+    but expressed as an energy-like proxy rather than a Gaussian kernel, giving
+    a complementary signal.  All ops are on-GPU tensors — no RDKit, no subprocess,
+    no conformer generation, O(N²) but with N≤29 and fully batched.
+
+    Why not StrainReward
+    --------------------
+    StrainReward (kept below for offline scoring) called AllChem.EmbedMolecule
+    (ETKDGv3) followed by MMFF94 minimization on every molecule:
+      - EmbedMolecule ignores the model's coordinates and generates a fresh
+        conformer from SMILES, so the energy measured has nothing to do with
+        what the model produced.
+      - ETKDGv3 + 200 MMFF iterations takes ~50-200 ms per molecule.
+      - At G=32 trajectories × B=12 × 3 checkpoint calls = 1,152 calls/step,
+        this adds 1-4 minutes per training step.
+
+    BondDeviationReward takes <1 ms per batch on GPU and measures the actual
+    coordinates the model generated.
+    """
+
+    SCALE: float = 0.2   # Å: mean deviation at which reward ≈ 0.37
+
+    def __call__(
+        self,
+        coords     : torch.Tensor,   # [B, N, 3]
+        atom_types : torch.Tensor,   # [B, N, A]
+        vocab      : Dict[int, str],
+    ) -> torch.Tensor:               # [B]
+        B = coords.shape[0]
+        scores = [
+            self._score_one(coords[b], decode_atom_types(atom_types[b], vocab))
+            for b in range(B)
+        ]
+        return torch.stack(scores).to(coords.device)
+
+    def _score_one(
+        self,
+        coords : torch.Tensor,   # [N, 3]
+        elems  : List[str],
+    ) -> torch.Tensor:           # scalar
+        N      = coords.shape[0]
+        device = coords.device
+
+        if N < 2:
+            return coords.new_tensor(1.0)
+
+        diff  = coords.unsqueeze(1) - coords.unsqueeze(0)   # [N, N, 3]
+        dists = diff.norm(dim=-1)                            # [N, N]
+
+        upper     = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
+        bond_mask = upper & (dists < _BOND_MAX_DIST)
+
+        if not bond_mask.any():
+            return coords.new_tensor(1.0)
+
+        d_ideal  = _build_ideal_dist_matrix(elems, device)         # [N, N]
+        dev      = (dists - d_ideal).abs()[bond_mask]               # [n_bonds]
+        mean_dev = dev.mean()
+        return torch.exp(-mean_dev / self.SCALE)
+
+
+# ── Sub-reward 2b: StrainReward — OFFLINE USE ONLY ────────────────────────────
+
+class StrainReward:
+    """
+    MMFF94 force-field energy per heavy atom (lower = more stable).
+
+    WARNING: Do NOT use during RL training.
+    ----------------------------------------
+    This class calls AllChem.EmbedMolecule (ETKDGv3), which:
+      1. Ignores the model's 3D coordinates — generates a new random conformer.
+      2. Takes ~50-200 ms per molecule (ETKDGv3 + 200 MMFF iterations).
+    At G×B×3 checkpoint evaluations per step this adds 1-4 minutes/step.
+
+    Use BondDeviationReward in MoleculeRewarder for training.
+    Use StrainReward in score.py / offline evaluation where cost is acceptable.
+
+    The raw energy (kcal/mol) is converted to a reward in (0, 1] via
+        r = exp(−energy_per_atom / scale)
+    with scale = 5 kcal/(mol·atom).  Falls back to UFF if MMFF94 parameters
+    are unavailable.
+    """
+
+    ENERGY_SCALE: float = 5.0
+
+    def __call__(
+        self,
+        mols : List[Optional[Chem.Mol]],
+    ) -> torch.Tensor:
+        rewards = [self._score_one(mol) for mol in mols]
+        return torch.tensor(rewards, dtype=torch.float)
+
+    def _score_one(self, mol: Optional[Chem.Mol]) -> float:
+        if mol is None:
+            return 0.0
+        try:
+            mol_h = Chem.AddHs(mol)
+            AllChem.EmbedMolecule(mol_h, AllChem.ETKDGv3())
+
+            n_heavy = mol.GetNumHeavyAtoms()
+            if n_heavy == 0:
+                return 0.0
+
+            if MMFFHasAllMoleculeParams(mol_h):
+                ff = MMFFGetMoleculeForceField(mol_h)
+            else:
+                ff = AllChem.UFFGetMoleculeForceField(mol_h)
+
+            if ff is None:
+                return 0.0
+
+            ff.Minimize(maxIts=200)
+            energy_per_atom = ff.CalcEnergy() / n_heavy
+            return math.exp(-energy_per_atom / self.ENERGY_SCALE)
+        except Exception:
+            return 0.0
+
+
+# ── Sub-reward 3: Chemical properties ─────────────────────────────────────────
 
 @dataclass
-class RewardConfig:
+class ChemTargets:
     """
-    Weights for get_reward().
-
-    geometry_weight  — all six force-field terms (structural, PoseBusters-aligned)
-    validity_weight  — RDKit single-fragment check
-    prop_weight      — QED + SA score, weighted high to drive inter-trajectory
-                       ranking variance for SDPO win-rate confidence
-
-    Flat across positions: all three rows (start, anchor, last) computed
-    identically. SDPO's interp_rewards handles position weighting.
+    Target ranges for chemical properties.  All ranges are inclusive.
+    Defaults follow Lipinski's rule-of-five with slightly relaxed logP.
     """
-    geometry_weight : float = 1.0   # present but not dominant — structural floor
-    validity_weight : float = 2.0
-    prop_weight     : float = 10.0   # primary SDPO ranking signal
-
-    active_props: List[str] = field(default_factory=lambda: ["qed", "sascore"])
-    extra_props : Dict[str, PropSpec] = field(default_factory=dict)
+    logp_min  : float = -0.4
+    logp_max  : float =  5.6
+    mw_max    : float = 500.0
+    sa_max    : float =  6.0    # SA score: 1 (easy) – 10 (hard); lower is better
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  RDKit validity
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_one_mol(
-    args : Tuple,
-    vocab: torch.Tensor,
-) -> Tuple[torch.Tensor, List]:
+class ChemicalReward:
     """
-    Build RDKit mols and score connectivity.
+    Four chemical sub-properties combined into a single score in [0, 1].
 
-      +2.0  single connected fragment  (valid molecule)
-      +0.2  disconnected but parseable (partial credit)
-      -0.5  empty / unparseable
+    Components and normalisation
+    ----------------------------
+    QED       : already in [0, 1].
+    SA score  : mapped (score − 1) / 9 → [0, 1], then inverted (1 = easy to synthesize).
+    logP      : 1.0 if in [logp_min, logp_max], otherwise Gaussian falloff.
+    MW        : 1.0 if ≤ mw_max, otherwise exponential penalty.
 
-    Returns (validity_scores [B], rdmols list[B]).
+    All four are averaged with equal weight before the adaptive weighter
+    combines them with the other sub-rewards.
+
+    Returns 0.0 for invalid / un-sanitized molecules.
     """
-    real_coords, real_nums = args
 
-    if len(real_nums) < 2: 
-        # Return negative reward to actively penalize single atoms
-        return torch.tensor([-2.0], device=real_coords.device), [None]
+    def __init__(self, targets: Optional[ChemTargets] = None):
+        self.targets = targets or ChemTargets()
 
-    mols    = build_mols_from_pipeline_output([real_coords, real_nums], vocab)
-    n_frags = [len(Chem.GetMolFrags(m)) if m is not None else 0 for m in mols]
-    nf_t    = torch.tensor(n_frags, dtype=torch.float32, device=real_coords.device)
+    def __call__(
+        self,
+        mols : List[Optional[Chem.Mol]],
+    ) -> torch.Tensor:                     # [B]
+        rewards = [self._score_one(mol) for mol in mols]
+        return torch.tensor(rewards, dtype=torch.float)
 
-    validity = torch.where(
-        nf_t == 1,
-        torch.full_like(nf_t,  2.0),
-        torch.where(
-            nf_t  > 1,
-            torch.full_like(nf_t,  0.2),
-            torch.full_like(nf_t, -0.5),
+    def _score_one(self, mol: Optional[Chem.Mol]) -> float:
+        if mol is None:
+            return 0.0
+        try:
+            t = self.targets
+
+            qed_score = QED.qed(mol)
+
+            sa_raw    = _compute_sa_score(mol)
+            sa_score  = 1.0 - (sa_raw - 1.0) / 9.0           # 1 = trivial, 0 = impossible
+            sa_score  = max(0.0, min(1.0, sa_score))
+            if sa_raw > t.sa_max:
+                sa_score *= 0.5   # soft penalty for very hard molecules
+
+            logp = Descriptors.MolLogP(mol)
+            if t.logp_min <= logp <= t.logp_max:
+                logp_score = 1.0
+            else:
+                deviation  = min(abs(logp - t.logp_min), abs(logp - t.logp_max))
+                logp_score = math.exp(-0.5 * (deviation / 1.5) ** 2)
+
+            mw = Descriptors.MolWt(mol)
+            if mw <= t.mw_max:
+                mw_score = 1.0
+            else:
+                mw_score = math.exp(-((mw - t.mw_max) / 100.0) ** 2)
+
+            return (qed_score + sa_score + logp_score + mw_score) / 4.0
+        except Exception:
+            return 0.0
+
+
+def _compute_sa_score(mol: Chem.Mol) -> float:
+    """
+    Synthetic accessibility score via RDKit's SA_Score contribution.
+    Uses the module-level _sascorer cached at import time.
+    Falls back to a neutral 5.0 if the module is unavailable.
+    """
+    if _sascorer is None:
+        return 5.0
+    return _sascorer.calculateScore(mol)
+
+
+# ── Sub-reward 4: Validity ────────────────────────────────────────────────────
+
+class ValidityReward:
+    """
+    Binary reward: 1.0 if RDKit produced a valid sanitized molecule, else 0.0.
+
+    This is the only sub-reward that is non-zero for *every* rollout, including
+    completely invalid geometries.  It acts as a floor signal that keeps the
+    model receiving gradient information even in early training when most
+    outputs are chemically invalid.
+    """
+
+    def __call__(
+        self,
+        mols : List[Optional[Chem.Mol]],
+    ) -> torch.Tensor:
+        return torch.tensor(
+            [1.0 if mol is not None else 0.0 for mol in mols],
+            dtype=torch.float,
         )
-    )
-    rdmols = [m if f == 1 else None for m, f in zip(mols, n_frags)]
-    return validity, rdmols
 
-def _diversity_reward(coords_all, atoms_num):
-    # Compute pairwise distances between trajectories
-    B = coords_all.shape[1]
-    coords_flat = coords_all.reshape(3, B, -1)  # [3, B, N*3]
-    dists = torch.cdist(coords_flat[2:], coords_flat[2:]).mean()  # Last timestep
-    return torch.clamp(dists / 10.0, max=1.0)  # Normalize
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
-def get_reward(
-    mols          : list,
-    rewarder      : EnergyRewarder,
-    vocab         : torch.Tensor,
-    vdW           = None,               # kept for API compatibility, unused
-    cfg           : Optional[RewardConfig] = None,
-    _update_buffer: bool = False,       # kept for API compatibility, no-op
-) -> torch.Tensor:                      # [3, B]
+# ── Adaptive weighter (Kendall et al., 2018) ─────────────────────────────────
+
+class AdaptiveWeighter(nn.Module):
     """
-    Evaluate denoised molecules at 3 diffusion timesteps.
+    Learns one log(σ²) parameter per sub-reward.
+
+    Combining n sub-rewards r_1 … r_n:
+        total = Σ_i  (1 / 2σ_i²) * r_i  −  Σ_i log(σ_i)
+              = Σ_i  exp(−s_i) * r_i  −  Σ_i  0.5 * s_i
+    where s_i = log(σ_i²).
+
+    High uncertainty (large σ) → small weight, but the −log σ term prevents
+    σ → ∞.  Gradients flow through both the sub-reward values *and* the σ
+    parameters, so the weighter trains jointly with the policy.
 
     Parameters
     ----------
-    mols : list of 3 pairs
-        [(coords_start, atoms_start), (coords_anchor, atoms_anchor),
-         (coords_last,  atoms_last)]
-    rewarder : EnergyRewarder
-    vocab    : torch.Tensor  mapping one-hot indices to atomic numbers
+    n_objectives : number of sub-rewards (default 4)
+    init_log_sigma_sq : initial value for all log(σ²) (0.0 = σ=1, equal weights)
+    """
+
+    def __init__(self, n_objectives: int = 4, init_log_sigma_sq: float = 0.0):
+        super().__init__()
+        self.log_sigma_sq = nn.Parameter(
+            torch.full((n_objectives,), init_log_sigma_sq)
+        )
+
+    def forward(self, sub_rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        sub_rewards : [B, n_objectives]  — each sub-reward in [0, 1]
+
+        Returns
+        -------
+        total_reward : [B]
+        """
+        # Precision weights: exp(−log σ²) = 1/σ²
+        precision  = torch.exp(-self.log_sigma_sq)             # [n_obj]
+        weighted   = (precision * sub_rewards).sum(dim=-1)     # [B]
+
+        # Regularisation term (scalar, broadcast-added to every molecule equally)
+        reg = 0.5 * self.log_sigma_sq.sum()
+
+        return weighted - reg
+
+    @property
+    def effective_weights(self) -> torch.Tensor:
+        """Normalised weights for logging/inspection. Not used in forward()."""
+        w = torch.exp(-self.log_sigma_sq)
+        return w / w.sum()
+
+
+# ── Top-level rewarder ────────────────────────────────────────────────────────
+
+class MoleculeRewarder:
+    """
+    Orchestrates all four sub-rewards for a batch of molecules.
+
+    Sub-rewards
+    -----------
+    1. GeometricReward     — bond-length + angle Z-scores (vectorized tensors)
+    2. BondDeviationReward — mean bond-length deviation from ideal (fast proxy
+                             for StrainReward; uses model's own coordinates)
+    3. ChemicalReward      — QED, SA, logP, MW (RDKit; zero for invalid mols)
+    4. ValidityReward      — binary sanitization success (always non-zero)
+
+    Usage
+    -----
+    rewarder = MoleculeRewarder(vocab)
+    weighter = AdaptiveWeighter(n_objectives=4)
+
+    reward, sub = rewarder(coords, atom_types, weighter)   # [B], [B, 4]
+    """
+
+    N_OBJECTIVES = 4
+
+    def __init__(
+        self,
+        vocab        : Dict[int, str],
+        chem_targets : Optional[ChemTargets] = None,
+    ):
+        self.vocab        = vocab
+        self.geometric    = GeometricReward()
+        self.bond_dev     = BondDeviationReward()
+        self.chemical     = ChemicalReward(chem_targets)
+        self.validity     = ValidityReward()
+
+    def __call__(
+        self,
+        coords     : torch.Tensor,      # [B, N, 3]
+        atom_types : torch.Tensor,      # [B, N, A]
+        weighter   : AdaptiveWeighter,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        total_reward  : [B]
+        sub_rewards   : [B, 4]  columns: [geometric, bond_dev, chemical, validity]
+        """
+        device = coords.device
+
+        # RDKit mols — needed by ChemicalReward and ValidityReward only
+        mols: List[Optional[Chem.Mol]] = [
+            build_rdkit_mol(coords[b], decode_atom_types(atom_types[b], self.vocab))
+            for b in range(coords.shape[0])
+        ]
+
+        r_geom     = self.geometric(coords, atom_types, self.vocab).to(device)
+        r_bond_dev = self.bond_dev(coords, atom_types, self.vocab).to(device)
+        r_chem     = self.chemical(mols).to(device)
+        r_valid    = self.validity(mols).to(device)
+
+        sub_rewards = torch.stack([r_geom, r_bond_dev, r_chem, r_valid], dim=-1)  # [B, 4]
+        total       = weighter(sub_rewards)
+
+        return total, sub_rewards
+
+
+# ── Batched wrapper for the training loop ────────────────────────────────────
+
+def get_reward_batched(
+    rewarder     : MoleculeRewarder,
+    weighter     : AdaptiveWeighter,
+    coords_g     : torch.Tensor,       # [G, B, N, 3]
+    atom_types_g : torch.Tensor,       # [G, B, N, A]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run MoleculeRewarder over all G trajectory groups.
 
     Returns
     -------
-    torch.Tensor  shape [3, B]  — flat weights, same computation for all rows.
+    rewards_g    : [G, B]    — total scalar reward per (trajectory, molecule)
+    sub_rewards_g: [G, B, 4] — sub-rewards for logging
     """
-    if cfg is None:
-        cfg = RewardConfig()
-    if len(mols) != 3:
-        raise ValueError(f"'mols' must contain 3 timestep pairs; got {len(mols)}.")
+    G = coords_g.shape[0]
+    rewards_list, sub_list = [], []
 
-    start, anchor, last = mols
-    device = start[0].device
+    for g in range(G):
+        r, sub = rewarder(coords_g[g], atom_types_g[g], weighter)
+        rewards_list.append(r)
+        sub_list.append(sub)
 
-    coords_all = torch.stack((start[:, :, :3], anchor[:, :, :3], last[:, :, :3]))  # [3, B, N, 3]
-    atoms_all  = torch.stack((start[:, :, 3:], anchor[:, :, 3:], last[:, :, 3:])) # [3, B, N, A]
-    atoms_num  = vocab[atoms_all.argmax(-1, keepdim=True)]                          # [3, B, N, 1]
-
-    # Centre coordinates
-    real_f   = (atoms_num > 0).float()
-    n_real   = real_f.sum(2, keepdim=True).clamp(min=1)
-    centroid = (coords_all * real_f).sum(2, keepdim=True) / n_real
-    coords_c = coords_all - centroid                                                # [3, B, N, 3]
-
-    # ── 1. Geometry reward (GPU, all six terms) ───────────────────────────────
-    geom    = rewarder.compute(coords_c, atoms_num)                                 # [3, B]
-    rewards = cfg.geometry_weight * geom
-
-    all_specs = {**DEFAULT_PROP_SPECS, **cfg.extra_props}
-
-    # ── 2. Validity + mol-prop rewards (flat, all three positions) ────────────
-    for m in range(3):
-        val_scores, rdmols = _parse_one_mol(
-            (coords_all[m], atoms_all[m]), vocab
-        )
-        rewards[m] += cfg.validity_weight * val_scores
-
-        if cfg.active_props and _RDKIT_OK:
-            prop_arr = _prop_scores(rdmols, all_specs, cfg.active_props)
-            prop_t   = torch.tensor(prop_arr, dtype=torch.float32, device=device)
-            rewards[m] += cfg.prop_weight * prop_t
-            
-    rewards += 0.5 * _diversity_reward(coords_all, atoms_num)  # Add diversity
-
-    return rewards
+    return torch.stack(rewards_list), torch.stack(sub_list)   # [G, B], [G, B, 4]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  Batched entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Logging helper ────────────────────────────────────────────────────────────
 
-def get_reward_batched(
-    all_mols : List,
-    rewarder : EnergyRewarder,
-    vocab    : torch.Tensor,
-    cfg      : Optional[RewardConfig] = None,
-) -> torch.Tensor:                      # [N_traj, 3, B]
+def reward_log_dict(
+    sub_rewards_g : torch.Tensor,      # [G, B, 4]
+    weighter      : AdaptiveWeighter,
+) -> Dict[str, torch.Tensor]:
     """
-    Score all trajectories. Returns stacked rewards [N_traj, 3, B].
-    """
-    if cfg is None:
-        cfg = RewardConfig()
+    Build a flat dict suitable for passing to self.log_dict().
 
-    return torch.stack([
-        get_reward(traj_mols, rewarder, vocab, cfg=cfg)
-        for traj_mols in all_mols
-    ])
+    Includes per-sub-reward means, effective adaptive weights, and σ values.
+    """
+    names = ['geometric', 'bond_dev', 'chemical', 'validity']
+    logs  = {}
+
+    for i, name in enumerate(names):
+        logs[f'reward_sub/{name}'] = sub_rewards_g[..., i].mean()
+
+    eff_w = weighter.effective_weights   # [4]
+    for i, name in enumerate(names):
+        logs[f'reward_weight/{name}'] = eff_w[i]
+        logs[f'reward_sigma/{name}']  = torch.exp(0.5 * weighter.log_sigma_sq[i])
+
+    return logs
