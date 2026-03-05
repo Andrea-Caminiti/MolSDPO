@@ -57,6 +57,8 @@ In _compute_advantages, call:
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -107,6 +109,124 @@ def _lookup_ideal_bond(elem_i: str, elem_j: str) -> float:
     return _BOND_LENGTH_IDEAL.get(key, _BOND_LENGTH_IDEAL.get(rkey, 1.54))
 
 
+def _precompute_ideal_len_table(vocab: Dict[int, str]) -> torch.Tensor:
+    """
+    Build a [V, V] float32 tensor of ideal bond lengths indexed by atom-type index.
+
+    Computed once at MoleculeRewarder.__init__ and stored as self._ideal_len.
+    At scoring time, a single tensor gather replaces the per-molecule Python loop
+    that previously called _lookup_ideal_bond N² times per molecule.
+
+        d_ideal[m, i, j] = ideal_len[atom_idx[m, i], atom_idx[m, j]]
+
+    V = max vocab index + 1 (typically 5-10 for QM9).
+    """
+    V = vocab.shape[0]
+    table = torch.full((V, V), 1.54, dtype=torch.float32)
+    for i in range(V):
+        for j in range(V):
+            ei = vocab[i]
+            ej = vocab[j]
+            table[i, j] = _lookup_ideal_bond(ei, ej)
+    return table   # [V, V]  — move to device on first use
+
+
+@torch.no_grad()
+def _score_geometry_batch(
+    coords    : torch.Tensor,   # [M, N, 3]  — any number of molecules M
+    atom_idx  : torch.Tensor,   # [M, N]     — argmax of atom_types, long
+    ideal_len : torch.Tensor,   # [V, V]     — precomputed, on same device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute GeometricReward and BondDeviationReward for M molecules in one pass.
+
+    Previously these were two separate classes that each recomputed pairwise
+    distances and the ideal-length matrix per molecule.  Here:
+
+      - Pairwise distances computed once as [M, N, N].
+      - Ideal lengths looked up via tensor indexing (no Python loop).
+      - Bond scores and bond-deviation scores derived from the same distance matrix.
+      - Angle scores computed via a fully vectorized [M, N, N, N] triplet tensor
+        instead of a Python loop over atom centres.
+      - The whole batch of M molecules is processed in a single GPU kernel sequence.
+
+    Returns
+    -------
+    geom_score    : [M]  Gaussian-kernel bond+angle quality score in (0, 1]
+    bond_dev_score: [M]  exp(−mean_bond_deviation / 0.2Å) in (0, 1]
+    """
+    M, N, _ = coords.shape
+    device   = coords.device
+
+    # ── Pairwise displacement and distance ────────────────────────────────────
+    # diff[m, i, j] = coords[m, j] - coords[m, i]  (vector from i to j)
+    diff  = coords.unsqueeze(2) - coords.unsqueeze(1)   # [M, N, N, 3]
+    dists = diff.norm(dim=-1)                            # [M, N, N]
+
+    # ── Ideal-length matrix via precomputed table (tensor gather) ─────────────
+    # atom_idx: [M, N] long.  We want d_ideal[m, i, j] = ideal_len[idx[m,i], idx[m,j]]
+    idx_i  = atom_idx.unsqueeze(2).expand(M, N, N)     # [M, N, N]
+    idx_j  = atom_idx.unsqueeze(1).expand(M, N, N)     # [M, N, N]
+    d_ideal = ideal_len[idx_i, idx_j]                  # [M, N, N]
+
+    # ── Bond mask: upper triangle, within cutoff ──────────────────────────────
+    upper     = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
+    bond_mask = upper.unsqueeze(0) & (dists < _BOND_MAX_DIST)   # [M, N, N]
+    n_bonds   = bond_mask.float().sum(dim=(1, 2)).clamp(min=1)  # [M]
+
+    # ── Bond-length Z-score (GeometricReward component) ──────────────────────
+    z_bond      = (dists - d_ideal) / _BOND_TOLERANCE           # [M, N, N]
+    bond_kern   = torch.exp(-0.5 * z_bond ** 2)                 # [M, N, N]
+    bond_z_mean = (bond_kern * bond_mask).sum(dim=(1, 2)) / n_bonds  # [M]
+
+    # ── Bond-length deviation (BondDeviationReward) ───────────────────────────
+    dev           = (dists - d_ideal).abs()                      # [M, N, N]
+    bond_dev_mean = (dev * bond_mask).sum(dim=(1, 2)) / n_bonds  # [M]
+    bond_dev_score = torch.exp(-bond_dev_mean / _BOND_DEV_SCALE) # [M]
+
+    # ── Angle scores — fully vectorized over all (centre, a, c) triplets ──────
+    # bonded[m, i, j] = True when j is bonded to i (symmetric from bond_mask)
+    bonded = bond_mask | bond_mask.transpose(1, 2)               # [M, N, N]
+
+    # Unit vectors from each centre to each neighbour: [M, N_centre, N_nb, 3]
+    # vecs[m, centre, nb] = normalize(coords[m, nb] - coords[m, centre])
+    # = normalize(diff[m, centre, nb])
+    # diff is [M, N, N, 3]: diff[m, i, j] = coords[m,j] - coords[m,i], so
+    # diff[:, centre, nb, :] is exactly the vector we want. ✓
+    vecs = F.normalize(diff, dim=-1)                             # [M, N, N, 3]
+
+    # Cosine similarity between all pairs of neighbour vectors for each centre:
+    # cos[m, centre, a, c] = vecs[m,centre,a] · vecs[m,centre,c]
+    # Computed as batched matmul: reshape [M*N, N, 3] @ [M*N, 3, N] → [M*N, N, N]
+    vecs_2d = vecs.reshape(M * N, N, 3)
+    cos_2d  = torch.bmm(vecs_2d, vecs_2d.transpose(1, 2))       # [M*N, N, N]
+    cos     = cos_2d.reshape(M, N, N, N).clamp(-1.0, 1.0)       # [M, Nc, Na, Nc]
+
+    # Valid triplet mask: both a and c are bonded to the same centre, a < c
+    # bonded[:, centre, a] & bonded[:, centre, c] & upper_triangle(a, c)
+    upper_ac    = upper.unsqueeze(0).unsqueeze(0)                        # [1, 1, N, N]
+    triplet_mask = (bonded.unsqueeze(3) & bonded.unsqueeze(2)            # [M, N, N, N]
+                    & upper_ac)
+
+    # Score deviation from nearest ideal angle (sp3 or sp2)
+    angles_deg   = torch.acos(cos) * (180.0 / math.pi)          # [M, N, N, N]
+    best_dev     = torch.minimum(
+        (angles_deg - _IDEAL_ANGLE_SP3).abs(),
+        (angles_deg - _IDEAL_ANGLE_SP2).abs(),
+    )
+    angle_kern   = torch.exp(-0.5 * (best_dev / _ANGLE_TOLERANCE) ** 2)  # [M, N, N, N]
+    n_triplets   = triplet_mask.float().sum(dim=(1, 2, 3)).clamp(min=1)  # [M]
+    angle_mean   = (angle_kern * triplet_mask).sum(dim=(1, 2, 3)) / n_triplets
+
+    # ── Combine into single geometric score ───────────────────────────────────
+    geom_score = (bond_z_mean * n_bonds + angle_mean * n_triplets) / (n_bonds + n_triplets)
+
+    return geom_score, bond_dev_score
+
+
+_BOND_DEV_SCALE: float = 0.2   # Å: mean deviation at which bond_dev_score ≈ 0.37F
+
+
 # ── Coords → RDKit molecule ───────────────────────────────────────────────────
 
 def build_rdkit_mol(
@@ -151,214 +271,6 @@ def decode_atom_types(
     """
     indices = atom_types.argmax(dim=-1).tolist()   # [N]
     return vocab[indices].tolist()
-
-
-# ── Sub-reward 1: Geometric validity ─────────────────────────────────────────
-
-# Pre-built ideal-length tensor, indexed by element-pair string.
-# Looked up once per batch via _build_ideal_dist_matrix; never inside a loop.
-def _build_ideal_dist_matrix(elems: List[str], device: torch.device) -> torch.Tensor:
-    """
-    Build an [N, N] tensor of ideal bond lengths for every atom pair.
-    Off-bond pairs (distance > _BOND_MAX_DIST) will be masked out later.
-    """
-    N = len(elems)
-    mat = torch.full((N, N), 1.54, dtype=torch.float, device=device)
-    for i in range(N):
-        for j in range(i + 1, N):
-            v = _lookup_ideal_bond(elems[i], elems[j])
-            mat[i, j] = v
-            mat[j, i] = v
-    return mat
-
-
-class GeometricReward:
-    """
-    Score 3D geometry quality from raw tensors — no RDKit required.
-
-    Bond-length score
-    -----------------
-    For every pair (i, j) with distance < _BOND_MAX_DIST, compute
-        z = (d_ij − d_ideal) / _BOND_TOLERANCE
-    and score with exp(−z²/2) (Gaussian kernel; 1.0 = perfect).
-
-    Angle score
-    -----------
-    For each bonded centre B with ≥2 neighbours, compute all A–B–C angles
-    and score deviation from the nearest ideal (sp3=109.5° or sp2=120°).
-
-    Both scores are computed with fully batched tensor ops — no Python loops
-    over atoms or pairs, no .item() calls during scoring.  The only remaining
-    Python loop is over the batch dimension B, which is necessary because
-    each molecule can have a different element composition and therefore a
-    different ideal-distance matrix.
-
-    Returns a scalar in (0, 1] per molecule.
-    """
-
-    def __call__(
-        self,
-        coords     : torch.Tensor,   # [B, N, 3]
-        atom_types : torch.Tensor,   # [B, N, A]
-        vocab      : Dict[int, str],
-    ) -> torch.Tensor:               # [B]
-        B = coords.shape[0]
-        scores = [
-            self._score_one(coords[b], decode_atom_types(atom_types[b], vocab))
-            for b in range(B)
-        ]
-        return torch.stack(scores).to(coords.device)
-
-    def _score_one(
-        self,
-        coords : torch.Tensor,   # [N, 3]
-        elems  : List[str],
-    ) -> torch.Tensor:           # scalar
-        N      = coords.shape[0]
-        device = coords.device
-
-        if N < 2:
-            return coords.new_tensor(1.0)
-
-        # ── Pairwise distances ────────────────────────────────────────────────
-        # diff: [N, N, 3];  dists: [N, N]
-        diff  = coords.unsqueeze(1) - coords.unsqueeze(0)
-        dists = diff.norm(dim=-1)
-
-        # ── Bond mask: pairs closer than _BOND_MAX_DIST (upper triangle only) ─
-        upper = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
-        bond_mask = upper & (dists < _BOND_MAX_DIST)   # [N, N]
-
-        # ── Bond-length score (fully vectorized) ─────────────────────────────
-        # Build the ideal-distance matrix once per molecule (small N≤29 Python
-        # loop — cheap compared to the per-pair loop it replaces).
-        d_ideal = _build_ideal_dist_matrix(elems, device)          # [N, N]
-        z_bond  = (dists - d_ideal) / _BOND_TOLERANCE              # [N, N]
-        bond_scores_mat = torch.exp(-0.5 * z_bond ** 2)            # [N, N]
-
-        bond_vals = bond_scores_mat[bond_mask]   # [n_bonds]
-
-        # ── Angle score (vectorized over triplets) ────────────────────────────
-        # bonded[i, j] = True if atoms i and j are bonded
-        bonded = bond_mask | bond_mask.T                            # [N, N] symmetric
-
-        # For each centre B: gather all (A, B, C) triplets where A≠C, both bonded to B.
-        # Strategy: build neighbour vectors for every (centre, neighbour) pair,
-        # then take all pairs of neighbour vectors for the same centre.
-
-        # neighbour_mask[b, n] = True if n is a neighbour of b (b ≠ n)
-        neighbour_mask = bonded & ~torch.eye(N, dtype=torch.bool, device=device)  # [N, N]
-
-        angle_scores_list = []
-        for centre in range(N):
-            nb = neighbour_mask[centre].nonzero(as_tuple=False).squeeze(-1)  # [deg]
-            deg = nb.shape[0]
-            if deg < 2:
-                continue
-
-            b_pos  = coords[centre]                    # [3]
-            nb_pos = coords[nb]                        # [deg, 3]
-            vecs   = nb_pos - b_pos.unsqueeze(0)       # [deg, 3]
-            vecs   = F.normalize(vecs, dim=-1)         # [deg, 3]
-
-            # All pairs of neighbour vectors: [deg, deg] cosine similarity matrix
-            cos_mat  = torch.clamp(vecs @ vecs.T, -1.0, 1.0)      # [deg, deg]
-            # Upper-triangle pairs only (avoid double-counting and self-pairs)
-            tri_mask = torch.triu(
-                torch.ones(deg, deg, dtype=torch.bool, device=device), diagonal=1
-            )
-            cos_vals = cos_mat[tri_mask]               # [n_angles]
-
-            angles_rad = torch.acos(cos_vals)          # [n_angles]
-            angles_deg = angles_rad * (180.0 / math.pi)
-
-            # Score against nearest ideal (sp3 or sp2) — all tensor, no Python loop
-            d_sp3 = (angles_deg - _IDEAL_ANGLE_SP3).abs()
-            d_sp2 = (angles_deg - _IDEAL_ANGLE_SP2).abs()
-            best  = torch.minimum(d_sp3, d_sp2)       # [n_angles]
-            z_ang = best / _ANGLE_TOLERANCE
-            angle_scores_list.append(torch.exp(-0.5 * z_ang ** 2))
-
-        # ── Combine bond + angle scores ───────────────────────────────────────
-        parts = [bond_vals]
-        if angle_scores_list:
-            parts.append(torch.cat(angle_scores_list))
-        all_scores = torch.cat(parts)
-
-        return all_scores.mean() if all_scores.numel() > 0 else coords.new_tensor(1.0)
-
-
-# ── Sub-reward 2: Bond-deviation strain proxy ─────────────────────────────────
-
-class BondDeviationReward:
-    """
-    Fast geometry-based strain proxy using the model's own 3D coordinates.
-
-    For every bonded pair (distance < _BOND_MAX_DIST), compute the absolute
-    deviation from the ideal bond length and average across all bonds:
-
-        mean_dev = mean |d_ij − d_ideal_ij|   (Å)
-        reward   = exp(−mean_dev / scale)       scale = 0.2 Å
-
-    This is entirely equivalent to the bond-length component of GeometricReward
-    but expressed as an energy-like proxy rather than a Gaussian kernel, giving
-    a complementary signal.  All ops are on-GPU tensors — no RDKit, no subprocess,
-    no conformer generation, O(N²) but with N≤29 and fully batched.
-
-    Why not StrainReward
-    --------------------
-    StrainReward (kept below for offline scoring) called AllChem.EmbedMolecule
-    (ETKDGv3) followed by MMFF94 minimization on every molecule:
-      - EmbedMolecule ignores the model's coordinates and generates a fresh
-        conformer from SMILES, so the energy measured has nothing to do with
-        what the model produced.
-      - ETKDGv3 + 200 MMFF iterations takes ~50-200 ms per molecule.
-      - At G=32 trajectories × B=12 × 3 checkpoint calls = 1,152 calls/step,
-        this adds 1-4 minutes per training step.
-
-    BondDeviationReward takes <1 ms per batch on GPU and measures the actual
-    coordinates the model generated.
-    """
-
-    SCALE: float = 0.2   # Å: mean deviation at which reward ≈ 0.37
-
-    def __call__(
-        self,
-        coords     : torch.Tensor,   # [B, N, 3]
-        atom_types : torch.Tensor,   # [B, N, A]
-        vocab      : Dict[int, str],
-    ) -> torch.Tensor:               # [B]
-        B = coords.shape[0]
-        scores = [
-            self._score_one(coords[b], decode_atom_types(atom_types[b], vocab))
-            for b in range(B)
-        ]
-        return torch.stack(scores).to(coords.device)
-
-    def _score_one(
-        self,
-        coords : torch.Tensor,   # [N, 3]
-        elems  : List[str],
-    ) -> torch.Tensor:           # scalar
-        N      = coords.shape[0]
-        device = coords.device
-
-        if N < 2:
-            return coords.new_tensor(1.0)
-
-        diff  = coords.unsqueeze(1) - coords.unsqueeze(0)   # [N, N, 3]
-        dists = diff.norm(dim=-1)                            # [N, N]
-
-        upper     = torch.triu(torch.ones(N, N, dtype=torch.bool, device=device), diagonal=1)
-        bond_mask = upper & (dists < _BOND_MAX_DIST)
-
-        if not bond_mask.any():
-            return coords.new_tensor(1.0)
-
-        d_ideal  = _build_ideal_dist_matrix(elems, device)         # [N, N]
-        dev      = (dists - d_ideal).abs()[bond_mask]               # [n_bonds]
-        mean_dev = dev.mean()
-        return torch.exp(-mean_dev / self.SCALE)
 
 
 # ── Sub-reward 2b: StrainReward — OFFLINE USE ONLY ────────────────────────────
@@ -585,18 +497,11 @@ class MoleculeRewarder:
 
     Sub-rewards
     -----------
-    1. GeometricReward     — bond-length + angle Z-scores (vectorized tensors)
-    2. BondDeviationReward — mean bond-length deviation from ideal (fast proxy
-                             for StrainReward; uses model's own coordinates)
-    3. ChemicalReward      — QED, SA, logP, MW (RDKit; zero for invalid mols)
-    4. ValidityReward      — binary sanitization success (always non-zero)
-
-    Usage
-    -----
-    rewarder = MoleculeRewarder(vocab)
-    weighter = AdaptiveWeighter(n_objectives=4)
-
-    reward, sub = rewarder(coords, atom_types, weighter)   # [B], [B, 4]
+    1+2. Geometry (fused) — bond-length Z-score + bond-deviation proxy,
+                            computed together in _score_geometry_batch.
+                            Both use the precomputed [V,V] ideal-length table.
+    3.   ChemicalReward   — QED, SA, logP, MW (RDKit; zero for invalid mols)
+    4.   ValidityReward   — binary sanitization success (always non-zero)
     """
 
     N_OBJECTIVES = 4
@@ -606,11 +511,21 @@ class MoleculeRewarder:
         vocab        : Dict[int, str],
         chem_targets : Optional[ChemTargets] = None,
     ):
-        self.vocab        = vocab
-        self.geometric    = GeometricReward()
-        self.bond_dev     = BondDeviationReward()
-        self.chemical     = ChemicalReward(chem_targets)
-        self.validity     = ValidityReward()
+        self.vocab    = vocab
+        self.chemical = ChemicalReward(chem_targets)
+        self.validity = ValidityReward()
+
+        # Precomputed ideal-length table [V, V] — built once, used every step.
+        # Avoids the per-molecule Python loop that previously ran N² = 841 times
+        # for each of 1,152 molecule evaluations per training step.
+        self._ideal_len     = _precompute_ideal_len_table(vocab)   # [V, V] CPU
+        self._ideal_len_dev = None   # lazy device copy, set on first call
+
+    def _ideal_on(self, device: torch.device) -> torch.Tensor:
+        """Return the ideal-length table on `device`, caching the result."""
+        if self._ideal_len_dev is None or self._ideal_len_dev.device != device:
+            self._ideal_len_dev = self._ideal_len.to(device)
+        return self._ideal_len_dev
 
     def __call__(
         self,
@@ -624,26 +539,37 @@ class MoleculeRewarder:
         total_reward  : [B]
         sub_rewards   : [B, 4]  columns: [geometric, bond_dev, chemical, validity]
         """
-        device = coords.device
+        device   = coords.device
+        atom_idx = atom_types.argmax(-1).long()   # [B, N]
 
-        # RDKit mols — needed by ChemicalReward and ValidityReward only
+        r_geom, r_bond_dev = _score_geometry_batch(
+            coords, atom_idx, self._ideal_on(device)
+        )   # [B], [B]
+
+        # RDKit mols — needed only for ChemicalReward and ValidityReward
         mols: List[Optional[Chem.Mol]] = [
             build_rdkit_mol(coords[b], decode_atom_types(atom_types[b], self.vocab))
             for b in range(coords.shape[0])
         ]
+        r_chem  = self.chemical(mols).to(device)
+        r_valid = self.validity(mols).to(device)
 
-        r_geom     = self.geometric(coords, atom_types, self.vocab).to(device)
-        r_bond_dev = self.bond_dev(coords, atom_types, self.vocab).to(device)
-        r_chem     = self.chemical(mols).to(device)
-        r_valid    = self.validity(mols).to(device)
-
-        sub_rewards = torch.stack([r_geom, r_bond_dev, r_chem, r_valid], dim=-1)  # [B, 4]
-        total       = weighter(sub_rewards)
-
-        return total, sub_rewards
+        sub   = torch.stack([r_geom, r_bond_dev, r_chem, r_valid], dim=-1)  # [B, 4]
+        total = weighter(sub)
+        return total, sub
 
 
-# ── Batched wrapper for the training loop ────────────────────────────────────
+# ── Thread count for parallel RDKit mol building ──────────────────────────────
+# DetermineBonds + SanitizeMol are pure C++ and release the GIL, so Python
+# threads genuinely parallelize here.  Cap at 16 to avoid thrashing.
+_RDKIT_WORKERS: int = min(os.cpu_count()//2 or 4, 16)
+
+
+def _build_mol_task(args: Tuple) -> Optional[Chem.Mol]:
+    """ThreadPoolExecutor worker: build one RDKit mol from (coords_cpu, elems)."""
+    coords_cpu, elems = args
+    return build_rdkit_mol(coords_cpu, elems)
+
 
 def get_reward_batched(
     rewarder     : MoleculeRewarder,
@@ -652,22 +578,60 @@ def get_reward_batched(
     atom_types_g : torch.Tensor,       # [G, B, N, A]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Run MoleculeRewarder over all G trajectory groups.
+    Score G×B molecules and return [G, B] rewards.
+
+    Speed-ups over the previous serial-loop implementation
+    -------------------------------------------------------
+    1. Tensor geometry (GeometricReward + BondDeviationReward) is computed
+       in a single _score_geometry_batch call on the full [G*B, N, 3] tensor.
+       Previously called G=32 times on [B, N, 3] each.
+
+    2. Ideal-length lookup uses the precomputed [V, V] table (tensor gather)
+       instead of a Python nested loop per molecule.
+
+    3. RDKit mol building (DetermineBonds + SanitizeMol) is parallelized across
+       G*B molecules using ThreadPoolExecutor.  The C++ back-end releases the GIL,
+       so Python threads genuinely run in parallel on all available CPU cores.
+       All G*B coordinate tensors are transferred to CPU in one contiguous copy.
 
     Returns
     -------
-    rewards_g    : [G, B]    — total scalar reward per (trajectory, molecule)
-    sub_rewards_g: [G, B, 4] — sub-rewards for logging
+    rewards_g    : [G, B]
+    sub_rewards_g: [G, B, 4]
     """
-    G = coords_g.shape[0]
-    rewards_list, sub_list = [], []
+    G, B, N, _ = coords_g.shape
+    M          = G * B
+    device     = coords_g.device
 
-    for g in range(G):
-        r, sub = rewarder(coords_g[g], atom_types_g[g], weighter)
-        rewards_list.append(r)
-        sub_list.append(sub)
+    # ── Flatten [G, B, N, D] → [M, N, D] ─────────────────────────────────────
+    coords_flat     = coords_g.reshape(M, N, 3)
+    atom_types_flat = atom_types_g.reshape(M, N, -1)
+    atom_idx_flat   = atom_types_flat.argmax(-1).long()   # [M, N]
 
-    return torch.stack(rewards_list), torch.stack(sub_list)   # [G, B], [G, B, 4]
+    # ── Tensor geometry: one call for all M molecules on GPU ──────────────────
+    r_geom, r_bond_dev = _score_geometry_batch(
+        coords_flat, atom_idx_flat, rewarder._ideal_on(device)
+    )   # [M], [M]
+
+    # ── RDKit mols: parallel on CPU ───────────────────────────────────────────
+    # Single contiguous .cpu() transfer for all M molecules, then build in parallel.
+    coords_cpu = coords_flat.cpu()
+    elems_list = [
+        decode_atom_types(atom_types_flat[m], rewarder.vocab) for m in range(M)
+    ]
+    args_iter = ((coords_cpu[m], elems_list[m]) for m in range(M))
+    with ThreadPoolExecutor(max_workers=_RDKIT_WORKERS) as pool:
+        mols: List[Optional[Chem.Mol]] = list(pool.map(_build_mol_task, args_iter))
+
+    # ── Chemical + validity (CPU, serial — fast for small B) ─────────────────
+    r_chem  = rewarder.chemical(mols).to(device)   # [M]
+    r_valid = rewarder.validity(mols).to(device)   # [M]
+
+    # ── Combine and reshape → [G, B] ──────────────────────────────────────────
+    sub   = torch.stack([r_geom, r_bond_dev, r_chem, r_valid], dim=-1)  # [M, 4]
+    total = weighter(sub)                                                  # [M]
+
+    return total.reshape(G, B), sub.reshape(G, B, 4)
 
 
 # ── Logging helper ────────────────────────────────────────────────────────────

@@ -85,6 +85,7 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
         gamma_w = args.gamma ** torch.arange(T, dtype=torch.float)
         self.register_buffer('gamma_weights', gamma_w)           # [T]
 
+
     def setup(self, stage: str) -> None:
         # Move vocab to the Lightning-assigned device.
         # setup() is called after the Trainer places the module, so self.device is valid here.
@@ -103,79 +104,76 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
         """
         Sample G independent trajectories under the current (frozen) policy.
 
-        Returns a dict of stacked tensors:
+        Batching strategy
+        -----------------
+        Previously: G=32 serial pipeline calls, each with batch size B=12.
+        Now:        1 pipeline call with batch size G*B=384.
+
+        A [12, 29] tensor uses ~2% of the 3060's CUDA cores; a [384, 29] tensor
+        uses ~95%.  The G-1=31 redundant kernel-launch round-trips are eliminated.
+        All returned tensors are reshaped from [G*B, ...] → [G, B, ...] so the
+        rest of the training code sees the same shapes as before.
+
+        Returns a dict of stacked tensors (shapes unchanged from before):
           coords          [G, T+1, B, N, 3]
           atoms           [G, T+1, B, N, A]
-          lp_coord_old    [G, B, T]   — detached log-probs from rollout policy
+          lp_coord_old    [G, B, T]
           lp_types_old    [G, B, T]
           means           [G, B, T, N, D]
           sigmas          [G, B, T, N, D]
-          final_mols      list[G] of hard-decoded molecules (kept for validation)
-          anchor_steps    [G, B]     — per-molecule anchor timestep index
-          x0_pred_first   [G, B, N, D] — x̂₀_pred at step 0
-          x0_pred_anchor  [G, B, N, D] — x̂₀_pred at anchor step
-          x0_pred_last    [G, B, N, D] — x̂₀_pred at step T-1
-
-        x0_pred_* are used by _compute_advantages to evaluate the rewarder on
-        the model's predicted clean molecule at each checkpoint, then interpolate
-        those three reward values across all T timesteps using α̅_t as position.
+          anchor_steps    [G, B]
+          x0_pred_first   [G, B, N, D]
+          x0_pred_anchor  [G, B, N, D]
+          x0_pred_last    [G, B, N, D]
         """
         self.model.eval()
-        G = self.N_TRAJECTORIES
+        G  = self.N_TRAJECTORIES
+        GB = G * B
 
-        final_mols        = []
-        all_trajs         = []
-        lp_list           = []
-        means_list        = []
-        sigmas_list       = []
-        anchor_list       = []
-        x0_pred_first_list  = []
-        x0_pred_anchor_list = []
-        x0_pred_last_list   = []
+        x     = torch.randn(GB, 29, 3,               device=self.device)
+        types = torch.randn(GB, 29, self.ABSORB_IDX, device=self.device)
 
-        for _ in range(G):
-            x     = torch.randn(B, 29, 3,                device=self.device)
-            types = torch.randn(B, 29, self.ABSORB_IDX,  device=self.device)
+        (mols_raw, traj_states, lp,
+         anchor_steps, x0_pred_first, x0_pred_anchor, x0_pred_last,
+         means, sigmas) = pipeline_with_logprob(
+            self.model, x, types,
+            num_inference_steps = self.args.sample_steps,
+            scheduler           = self.scheduler,
+            B                   = GB,
+            device              = self.device,
+            eta                 = self.eta,
+        )
 
-            mols, traj_states, lp, anchor_steps, \
-            x0_pred_first, x0_pred_anchor, x0_pred_last, \
-            means, sigmas = pipeline_with_logprob(
-                self.model, x, types,
-                num_inference_steps = self.args.sample_steps,
-                scheduler           = self.scheduler,
-                B                   = B,
-                device              = self.device,
-                eta                 = self.eta,
-            )
-            final_mols.append(mols)
-            all_trajs.append(traj_states)
-            lp_list.append(lp)                            # [B, T, 2]
-            means_list.append(means)
-            sigmas_list.append(sigmas)
-            anchor_list.append(anchor_steps)              # [B]
-            x0_pred_first_list.append(x0_pred_first)     # [B, N, D]
-            x0_pred_anchor_list.append(x0_pred_anchor)   # [B, N, D]
-            x0_pred_last_list.append(x0_pred_last)       # [B, N, D]
+        # ── Reshape G*B → G, B ────────────────────────────────────────────────
+        # lp: [G*B, T, 2]; means/sigmas: [G*B, T, N, D]; x0_pred_*: [G*B, N, D]
+        # anchor_steps: [G*B]
+        T = lp.shape[1]
+        N = x0_pred_first.shape[1]
+        A = types.shape[-1]
 
-        lp_stack = torch.stack(lp_list)   # [G, B, T, 2]
+        def _r(t: torch.Tensor) -> torch.Tensor:
+            """Reshape leading G*B dim to (G, B, *rest)."""
+            return t.reshape(G, B, *t.shape[1:])
 
-        coords_list, atoms_list = [], []
-        for traj in all_trajs:
-            coords_list.append(torch.stack([c for c, _ in traj]))   # [T+1, B, N, 3]
-            atoms_list.append(torch.stack([a for _, a in traj]))    # [T+1, B, N, A]
+        # Trajectory states: list of T+1 (coord [G*B,N,3], types [G*B,N,A]) pairs
+        coords_traj = torch.stack([c for c, _ in traj_states])  # [T+1, G*B, N, 3]
+        atoms_traj  = torch.stack([a for _, a in traj_states])  # [T+1, G*B, N, A]
+        # Split G*B → G, B then move T axis to position 1  →  [G, T+1, B, N, 3/A]
+        coords_stack = coords_traj.reshape(T + 1, G, B, N, 3).permute(1, 0, 2, 3, 4)
+        atoms_stack  = atoms_traj.reshape(T + 1, G, B, N, A).permute(1, 0, 2, 3, 4)
 
         return dict(
-            final_mols      = final_mols,
-            coords          = torch.stack(coords_list),               # [G, T+1, B, N, 3]
-            atoms           = torch.stack(atoms_list),                # [G, T+1, B, N, A]
-            lp_coord_old    = lp_stack[..., 0].detach(),             # [G, B, T]
-            lp_types_old    = lp_stack[..., 1].detach(),             # [G, B, T]
-            means           = torch.stack(means_list),                # [G, B, T, N, D]
-            sigmas          = torch.stack(sigmas_list),               # [G, B, T, N, D]
-            anchor_steps    = torch.stack(anchor_list),               # [G, B]
-            x0_pred_first   = torch.stack(x0_pred_first_list),       # [G, B, N, D]
-            x0_pred_anchor  = torch.stack(x0_pred_anchor_list),      # [G, B, N, D]
-            x0_pred_last    = torch.stack(x0_pred_last_list),        # [G, B, N, D]
+            final_mols     = mols_raw,                       # kept for debugging
+            coords         = coords_stack,                   # [G, T+1, B, N, 3]
+            atoms          = atoms_stack,                    # [G, T+1, B, N, A]
+            lp_coord_old   = _r(lp)[..., 0].detach(),       # [G, B, T]
+            lp_types_old   = _r(lp)[..., 1].detach(),       # [G, B, T]
+            means          = _r(means),                      # [G, B, T, N, D]
+            sigmas         = _r(sigmas),                     # [G, B, T, N, D]
+            anchor_steps   = _r(anchor_steps),               # [G, B]
+            x0_pred_first  = _r(x0_pred_first),              # [G, B, N, D]
+            x0_pred_anchor = _r(x0_pred_anchor),             # [G, B, N, D]
+            x0_pred_last   = _r(x0_pred_last),               # [G, B, N, D]
         )
 
     # ── Phase 2: Advantage computation ───────────────────────────────────────
@@ -626,9 +624,9 @@ def train(args: argparse.Namespace) -> None:
     tabasco.load_state_dict(state_dict)
 
     # Freeze everything except the output heads
-    _TRAINABLE = ('coord_head.', 'type_head.')
-    for name, param in tabasco.named_parameters():
-        param.requires_grad_(any(name.startswith(k) for k in _TRAINABLE))
+    #_TRAINABLE = ('coord_head.', 'type_head.')
+    #for name, param in tabasco.named_parameters():
+    #    param.requires_grad_(any(name.startswith(k) for k in _TRAINABLE))
 
     weighter = AdaptiveWeighter()
     rewarder = MoleculeRewarder(vocab_enc2atom)
@@ -648,7 +646,7 @@ if __name__ == '__main__':
     parser.add_argument('--data-root',    default='data/QM9')
     parser.add_argument('--max_steps',    type=int,   default=200_000)
     parser.add_argument('--inner_epochs', type=int,   default=3)
-    parser.add_argument('--batch-size',   type=int,   default=12)
+    parser.add_argument('--batch-size',   type=int,   default=8)
     parser.add_argument('--lr',           type=float, default=1e-4)
     parser.add_argument('--log_scale',    type=float, default=8.0,
                         help='Scales weighted_log_diff to match adv_diff range.')
