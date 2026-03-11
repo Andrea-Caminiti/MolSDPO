@@ -95,16 +95,14 @@ def _select_anchor(all_clean: torch.Tensor, device: torch.device):
     first_expanded = all_clean[:, 0:1].expand_as(all_clean)
     last_expanded  = all_clean[:, -1:].expand_as(all_clean)
 
-    # Cosine similarity to start and end, combined channels
     def _cos_sim(a, b):
         return F.cosine_similarity(a.flatten(2, 3), b.flatten(2, 3), dim=2)
 
-    sim_first = _cos_sim(all_clean, first_expanded)   # [B, T]
-    sim_last  = _cos_sim(all_clean, last_expanded)    # [B, T]
+    sim_first = _cos_sim(all_clean, first_expanded)   #[B, T]
+    sim_last  = _cos_sim(all_clean, last_expanded)    #[B, T]
 
-    # Anchor = step with maximum combined similarity (most "in the middle")
-    divergence   = sim_first + sim_last               # [B, T]
-    anchor_steps = torch.argmax(divergence, dim=1)    # [B]
+    divergence   = sim_first + sim_last               #[B, T]
+    anchor_steps = torch.argmin(divergence, dim=1)    #[B]
     return anchor_steps
 
 
@@ -121,30 +119,18 @@ def pipeline_with_logprob(
 ):
     """
     Full denoising rollout with per-step log-probabilities and
-    x̂₀_pred snapshots at three trajectory checkpoints.
-
-    The three checkpoints replace the previous sim_first / sim_anchor / sim_last
-    similarity signals.  Instead of blending rewards by geometric similarity to
-    reference states, the caller (train._compute_advantages) interpolates in
-    α̅_t space — using the noise schedule as a principled positional axis —
-    between reward values evaluated on the x̂₀_pred at each checkpoint.
-
-    x̂₀_pred is the model's estimate of the fully clean molecule from the
-    current noisy state.  It is computed inside every DDIM step at no
-    extra cost.  Evaluating the rewarder on x̂₀_pred rather than on the
-    raw noisy state gives a meaningful signal even at early (noisy) timesteps,
-    which is the key advantage of this approach.
+    x_pred snapshots at three trajectory checkpoints.
 
     Returns
     -------
-    mols            : list of 3 tensors [B, N, 3+A]  — hard-decoded molecules
+    mols            : list of 3 tensors [B, N, 3+A]   hard-decoded molecules
                       at t=first, t=anchor, t=last (kept for validation use)
-    all_mols        : list of T+1 (coord, types) pairs — full trajectory states
-    all_log_probs   : [B, T, 2]  — (log_p_coord, log_p_types) per step
-    anchor_steps    : [B]        — per-molecule anchor step index
-    x0_pred_first   : [B, N, D]  — x̂₀_pred at step 0   (D = coord_dim + A)
-    x0_pred_anchor  : [B, N, D]  — x̂₀_pred at anchor step
-    x0_pred_last    : [B, N, D]  — x̂₀_pred at step T-1
+    all_mols        : list of T+1 (coord, types) pairs full trajectory states
+    all_log_probs   : [B, T, 2]   (log_p_coord, log_p_types) per step
+    anchor_steps    : [B]         per-molecule anchor step index
+    x0_pred_first   : [B, N, D]   x_pred at step 0 (D = coord_dim + A)
+    x0_pred_anchor  : [B, N, D]   x_pred at anchor step
+    x0_pred_last    : [B, N, D]   x_pred at step T-1
     all_means       : [B, T, N, D]
     all_sigmas      : [B, T, N, D]
     """
@@ -170,15 +156,11 @@ def pipeline_with_logprob(
 
         all_mols.append((x, types))
 
-        # all_clean stores x̂₀_pred (coords + types) at every step.
-        # This is the model's best estimate of the clean molecule at step i,
-        # and is used below to extract the three checkpoint snapshots.
-        all_clean.append(torch.cat((clean, clean_t), dim=-1))          # [B, N, D]
+        all_clean.append(torch.cat((clean, clean_t), dim=-1))          #[B, N, D]
         all_log_probs.append(torch.stack((log_prob_coord, log_prob_type), dim=-1))
         all_means.append(torch.cat([mean_coord, mean_types], dim=-1))
         all_sigmas.append(torch.cat([sig_coord,  sig_types], dim=-1))
 
-        # Decode hard molecules at first and last step for mols list
         if i == 0 or i == num_inference_steps - 1:
             clean_t_soft = F.softmax(clean_t, dim=-1)
             y_hard = torch.zeros_like(clean_t_soft).scatter_(
@@ -186,28 +168,22 @@ def pipeline_with_logprob(
             )
             mols.append(torch.cat([clean, y_hard], dim=-1))
 
-    all_clean     = torch.stack(all_clean,     dim=1)   # [B, T, N, D]
-    all_log_probs = torch.stack(all_log_probs, dim=1)   # [B, T, 2]
-    all_means     = torch.stack(all_means,     dim=1)   # [B, T, N, D]
-    all_sigmas    = torch.stack(all_sigmas,    dim=1)   # [B, T, N, D]
+    all_clean     = torch.stack(all_clean,     dim=1)   #[B, T, N, D]
+    all_log_probs = torch.stack(all_log_probs, dim=1)   #[B, T, 2]
+    all_means     = torch.stack(all_means,     dim=1)   #[B, T, N, D]
+    all_sigmas    = torch.stack(all_sigmas,    dim=1)   #[B, T, N, D]
 
-    # ── Anchor selection ──────────────────────────────────────────────────────
-    # Same criterion as before: step of maximum divergence from both endpoints.
-    # Anchor step is still needed to identify the mid-trajectory checkpoint.
-    anchor_steps = _select_anchor(all_clean, device)   # [B]
+    anchor_steps = _select_anchor(all_clean, device)   #[B]
 
-    # Decode anchor state and insert into mols list (index 1)
-    ori_latents_anchor = all_clean[torch.arange(B, device=device), anchor_steps]  # [B, N, D]
+    ori_latents_anchor = all_clean[torch.arange(B, device=device), anchor_steps]  #[B, N, D]
     c_anc, a_anc = ori_latents_anchor[..., :coord_dim], ori_latents_anchor[..., coord_dim:]
     a_soft = F.softmax(a_anc, dim=-1)
     y_hard = torch.zeros_like(a_soft).scatter_(-1, a_soft.argmax(dim=-1, keepdim=True), 1.0)
     mols.insert(1, torch.cat([c_anc, y_hard], dim=-1))
 
-    # ── x̂₀_pred at the three checkpoints ─────────────────────────────────────
-    # These are indexed directly from all_clean — no extra forward passes.
-    x0_pred_first  = all_clean[:, 0]                                               # [B, N, D]
-    x0_pred_anchor = all_clean[torch.arange(B, device=device), anchor_steps]      # [B, N, D]
-    x0_pred_last   = all_clean[:, -1]                                              # [B, N, D]
+    x0_pred_first  = all_clean[:, 0]                                               #[B, N, D]
+    x0_pred_anchor = all_clean[torch.arange(B, device=device), anchor_steps]      #[B, N, D]
+    x0_pred_last   = all_clean[:, -1]                                              #[B, N, D]
 
     return (
         mols,

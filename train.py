@@ -9,18 +9,14 @@ from model.model import TabascoV2
 from data.dataloader import build_qm9_dataloader
 from torch.utils.data import DataLoader, Dataset
 from RL.SDPO import pipeline_with_logprob, ddim_step_with_logprob
-from RL.reward import get_reward_batched, MoleculeRewarder, AdaptiveWeighter, reward_log_dict
+from RL.reward import (get_reward_batched, MoleculeRewarder, AdaptiveWeighter,
+                       NoveltyBuffer, compute_diversity, compute_novelty_batched, reward_log_dict)
 from RL.validation import ValidationMixin
 from diffusers import DDIMScheduler
 from config import DDIM_config
 import faulthandler
 
 faulthandler.enable()
-
-
-# ── Dummy data infrastructure ─────────────────────────────────────────────────
-# RL training does not consume real data batches — the model generates its own
-# data via rollouts. A dummy dataset is used purely to drive Lightning's loop.
 
 class _RLDummyDataset(Dataset):
     def __init__(self, length: int):
@@ -35,7 +31,7 @@ class _RLDummyDataset(Dataset):
 
 class RLDataModule(pl.LightningDataModule):
     TRAIN_LEN = 10_000_000
-    VAL_LEN   = 1_000
+    VAL_LEN   = 1
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(_RLDummyDataset(self.TRAIN_LEN), batch_size=1, num_workers=0)
@@ -44,11 +40,9 @@ class RLDataModule(pl.LightningDataModule):
         return DataLoader(_RLDummyDataset(self.VAL_LEN), batch_size=1, num_workers=0)
 
 
-# ── Lightning module ──────────────────────────────────────────────────────────
-
 class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
 
-    N_TRAJECTORIES: int = 32   # G: number of independent rollouts per step
+    N_TRAJECTORIES: int = 32 #G: number of independent rollouts per step
 
     def __init__(
         self,
@@ -68,27 +62,27 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
         self.rewarder     = rewarder
         self.weighter     = weighter
         self.ABSORB_IDX   = absorb_idx
-        self.vocab        = vocab         # moved to device in setup()
+        self.vocab        = vocab       
         self.train_smiles = set(train_smiles)
         self.val_n_samples = 1_000
         self.eta           = 1.0
 
         self.scheduler = DDIMScheduler.from_config(DDIM_config)
 
-        # λ time-decay weights: lam_t[t] = λ^t, shape [T].
-        # Registered as a buffer so Lightning moves it to the correct device automatically.
+        #Novelty buffer tracks recently generated SMILES so the reward
+        #function can penalise the model for repeatedly generating the same
+        #molecules.  Capacity default 5000
+        self.novelty_buffer = NoveltyBuffer(capacity=args.novelty_buf_size)
+
         T     = args.sample_steps
         lam_t = args.lam ** torch.arange(T, dtype=torch.float)
-        self.register_buffer('lam_t', lam_t)                    # [T]
+        self.register_buffer('lam_t', lam_t) #[T]
 
-        # Discount weights for return computation
         gamma_w = args.gamma ** torch.arange(T, dtype=torch.float)
-        self.register_buffer('gamma_weights', gamma_w)           # [T]
+        self.register_buffer('gamma_weights', gamma_w) #[T]
 
 
     def setup(self, stage: str) -> None:
-        # Move vocab to the Lightning-assigned device.
-        # setup() is called after the Trainer places the module, so self.device is valid here.
         self.vocab = self.vocab.to(self.device)
 
     def configure_optimizers(self):
@@ -97,24 +91,12 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             trainable, lr=self.args.lr, weight_decay=0.01, betas=(0.9, 0.95)
         )
 
-    # ── Phase 1: Rollout ──────────────────────────────────────────────────────
-
     @torch.no_grad()
     def _rollout(self, B: int) -> dict:
         """
         Sample G independent trajectories under the current (frozen) policy.
 
-        Batching strategy
-        -----------------
-        Previously: G=32 serial pipeline calls, each with batch size B=12.
-        Now:        1 pipeline call with batch size G*B=384.
-
-        A [12, 29] tensor uses ~2% of the 3060's CUDA cores; a [384, 29] tensor
-        uses ~95%.  The G-1=31 redundant kernel-launch round-trips are eliminated.
-        All returned tensors are reshaped from [G*B, ...] → [G, B, ...] so the
-        rest of the training code sees the same shapes as before.
-
-        Returns a dict of stacked tensors (shapes unchanged from before):
+        Returns a dict of stacked tensors:
           coords          [G, T+1, B, N, 3]
           atoms           [G, T+1, B, N, A]
           lp_coord_old    [G, B, T]
@@ -144,9 +126,6 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             eta                 = self.eta,
         )
 
-        # ── Reshape G*B → G, B ────────────────────────────────────────────────
-        # lp: [G*B, T, 2]; means/sigmas: [G*B, T, N, D]; x0_pred_*: [G*B, N, D]
-        # anchor_steps: [G*B]
         T = lp.shape[1]
         N = x0_pred_first.shape[1]
         A = types.shape[-1]
@@ -155,53 +134,32 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             """Reshape leading G*B dim to (G, B, *rest)."""
             return t.reshape(G, B, *t.shape[1:])
 
-        # Trajectory states: list of T+1 (coord [G*B,N,3], types [G*B,N,A]) pairs
-        coords_traj = torch.stack([c for c, _ in traj_states])  # [T+1, G*B, N, 3]
-        atoms_traj  = torch.stack([a for _, a in traj_states])  # [T+1, G*B, N, A]
-        # Split G*B → G, B then move T axis to position 1  →  [G, T+1, B, N, 3/A]
+        #Trajectory states: list of T+1 (coord [G*B,N,3], types [G*B,N,A]) pairs
+        coords_traj = torch.stack([c for c, _ in traj_states])  #[T+1, G*B, N, 3]
+        atoms_traj  = torch.stack([a for _, a in traj_states])  #[T+1, G*B, N, A]
+        #Split G*B → G, B then move T axis to position 1  →  [G, T+1, B, N, 3/A]
         coords_stack = coords_traj.reshape(T + 1, G, B, N, 3).permute(1, 0, 2, 3, 4)
         atoms_stack  = atoms_traj.reshape(T + 1, G, B, N, A).permute(1, 0, 2, 3, 4)
 
         return dict(
-            final_mols     = mols_raw,                       # kept for debugging
-            coords         = coords_stack,                   # [G, T+1, B, N, 3]
-            atoms          = atoms_stack,                    # [G, T+1, B, N, A]
-            lp_coord_old   = _r(lp)[..., 0].detach(),       # [G, B, T]
-            lp_types_old   = _r(lp)[..., 1].detach(),       # [G, B, T]
-            means          = _r(means),                      # [G, B, T, N, D]
-            sigmas         = _r(sigmas),                     # [G, B, T, N, D]
-            anchor_steps   = _r(anchor_steps),               # [G, B]
-            x0_pred_first  = _r(x0_pred_first),              # [G, B, N, D]
-            x0_pred_anchor = _r(x0_pred_anchor),             # [G, B, N, D]
-            x0_pred_last   = _r(x0_pred_last),               # [G, B, N, D]
+            final_mols     = mols_raw,                       
+            coords         = coords_stack, #[G, T+1, B, N, 3]
+            atoms          = atoms_stack, #[G, T+1, B, N, A]
+            lp_coord_old   = _r(lp)[..., 0].detach(), #[G, B, T]
+            lp_types_old   = _r(lp)[..., 1].detach(), #[G, B, T]
+            means          = _r(means), #[G, B, T, N, D]
+            sigmas         = _r(sigmas), #[G, B, T, N, D]
+            anchor_steps   = _r(anchor_steps), #[G, B]
+            x0_pred_first  = _r(x0_pred_first), #[G, B, N, D]
+            x0_pred_anchor = _r(x0_pred_anchor), #[G, B, N, D]
+            x0_pred_last   = _r(x0_pred_last), #[G, B, N, D]
         )
-
-    # ── Phase 2: Advantage computation ───────────────────────────────────────
 
     @torch.no_grad()
     def _compute_advantages(self, rollout: dict, T: int) -> dict:
         """
         Compute dense per-timestep advantages using x̂₀_pred checkpoints and
         piecewise-linear interpolation in α̅_t space.
-
-        Why x̂₀_pred instead of actual noisy states
-        --------------------------------------------
-        The rewarder is evaluated on the model's *predicted clean molecule*
-        (x̂₀_pred) at three trajectory checkpoints, not on the raw noisy states.
-        This matters because:
-          - A noisy state at t=5/25 is ~80% noise — the rewarder score is
-            dominated by random noise rather than model quality.
-          - x̂₀_pred at the same step is the model's best current estimate of
-            the final clean molecule, which carries genuine signal.
-        Both evaluations cost the same (3 rewarder calls); x̂₀_pred is simply
-        already stored in all_clean at zero extra compute cost.
-
-        Why α̅_t instead of cosine similarity for interpolation
-        -------------------------------------------------------
-        α̅_t = alphas_cumprod[timestep_t] rises monotonically from ~0 (noisy,
-        step 0) to ~1 (clean, step T-1) as denoising progresses.  It is a
-        principled measure of "how far along the denoising trajectory are we"
-        that is grounded in the noise schedule rather than a geometric heuristic.
 
         Interpolation scheme
         --------------------
@@ -211,124 +169,132 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
           Segment 1  [0,   a_b] : linearly blend r_first  → r_anchor  in α̅ space
           Segment 2  [a_b, T-1] : linearly blend r_anchor → r_final   in α̅ space
 
-        The three checkpoint steps are pinned exactly to their measured reward
-        values after interpolation.
         """
         G = self.N_TRAJECTORIES
         B = rollout['x0_pred_first'].shape[1]
         COORD_DIM = 3
 
-        # ── Retrieve x̂₀_pred at the three checkpoints ────────────────────────
-        # Split combined [G, B, N, D] into coords [G, B, N, 3] and types [G, B, N, A]
-        x0_first  = rollout['x0_pred_first']    # [G, B, N, D]
-        x0_anchor = rollout['x0_pred_anchor']   # [G, B, N, D]
-        x0_last   = rollout['x0_pred_last']     # [G, B, N, D]
+       
+        x0_first  = rollout['x0_pred_first'] #[G, B, N, D]
+        x0_anchor = rollout['x0_pred_anchor'] #[G, B, N, D]
+        x0_last   = rollout['x0_pred_last'] #[G, B, N, D]
 
         def split(x):
             return x[..., :COORD_DIM], x[..., COORD_DIM:]
 
-        # ── Evaluate rewarder on x̂₀_pred at each checkpoint ──────────────────
-        # get_reward_batched loops over G and returns [G, B] and [G, B, 4].
-        r_first,  _         = get_reward_batched(self.rewarder, self.weighter, *split(x0_first))
-        r_anchor, _         = get_reward_batched(self.rewarder, self.weighter, *split(x0_anchor))
+        
+        r_first,  _ = get_reward_batched(self.rewarder, self.weighter, *split(x0_first))
+        r_anchor, _ = get_reward_batched(self.rewarder, self.weighter, *split(x0_anchor))
         r_final,  sub_final = get_reward_batched(self.rewarder, self.weighter, *split(x0_last))
-        # r_*: [G, B]
 
-        rewards_stack = torch.stack([r_first, r_anchor, r_final], dim=1)  # [G, 3, B]
+        #Diversity bonus  encourages G trajectories to be structurally distinct
+        #For each batch position b, how different is trajectory g's predicted
+        #clean molecule from the other G-1 trajectories?  
 
-        # ── α̅_t at the T inference steps ──────────────────────────────────────
-        # scheduler.timesteps: [T] of actual noise-level indices (high → low)
-        # alphas_cumprod[t] rises as t falls (more denoising = higher α̅)
-        # Result: ab[i] is monotonically INCREASING with step index i.
+        dw = self.args.diversity_weight
+        div_first = compute_diversity(x0_first[..., COORD_DIM:]) #[G, B]
+        div_anchor = compute_diversity(x0_anchor[..., COORD_DIM:])
+        div_last = compute_diversity(x0_last[..., COORD_DIM:])
+
+        #Novelty bonus penalises repeated generation of the same molecules
+        #Score 1.0 if this molecule has not appeared in the last
+        #`novelty_buf_size` unique SMILES; 0.0 otherwise.
+        #Applied only at x̂₀_last (novelty is an end-state property).
+        nw = self.args.novelty_weight
+        nov_last = compute_novelty_batched(
+            x0_last[..., :COORD_DIM], x0_last[..., COORD_DIM:],
+            self.rewarder.vocab, self.novelty_buffer,
+        )   #[G, B]
+
+        r_first_aug  = r_first  + dw * div_first
+        r_anchor_aug = r_anchor + dw * div_anchor
+        r_final_aug  = r_final  + dw * div_last + nw * nov_last
+
+        rewards_stack = torch.stack([r_first, r_anchor, r_final], dim=1)   #[G, 3, B]
+        rewards_aug   = torch.stack([r_first_aug, r_anchor_aug, r_final_aug], dim=1)
+
+
         ab = self.scheduler.alphas_cumprod[
             self.scheduler.timesteps[:T].cpu()
-        ].to(self.device)   # [T], increasing
+        ].to(self.device)   
 
-        # ── Piecewise-linear dense reward interpolation ────────────────────────
         def interp_rewards(
-            rw        : torch.Tensor,   # [3, B]  stacked (r_first, r_anchor, r_final)
-            anc_steps : torch.Tensor,   # [B]     anchor step index per molecule
-        ) -> torch.Tensor:              # [B, T]
-            r_f = rw[0]   # [B]
-            r_a = rw[1]   # [B]
-            r_l = rw[2]   # [B]
+            rw        : torch.Tensor, #[3, B]  stacked (r_first, r_anchor, r_final)
+            anc_steps : torch.Tensor, #[B]     anchor step index per molecule
+        ) -> torch.Tensor: #[B, T]
+            r_f = rw[0] #[B]
+            r_a = rw[1] #[B]
+            r_l = rw[2] #[B]
 
-            # α̅ at anchor per molecule, expanded for broadcasting
-            ab_anc = ab[anc_steps].unsqueeze(-1)   # [B, 1]
-            ab_0   = ab[0]                          # scalar
-            ab_T   = ab[-1]                         # scalar
-            ab_t   = ab.unsqueeze(0)                # [1, T]
+            ab_anc = ab[anc_steps].unsqueeze(-1) #[B, 1]
+            ab_0 = ab[0] 
+            ab_T = ab[-1] 
+            ab_t = ab.unsqueeze(0) #[1, T]
 
-            # Segment 1: blend r_first → r_anchor over [ab_0, ab_anc]
-            denom1 = (ab_anc - ab_0).clamp(min=1e-6)           # [B, 1]
-            w1     = ((ab_t - ab_0) / denom1).clamp(0.0, 1.0)  # [B, T]
-            seg1   = r_f.unsqueeze(-1) * (1 - w1) + r_a.unsqueeze(-1) * w1  # [B, T]
+            denom1 = (ab_anc - ab_0).clamp(min=1e-6) #[B, 1]
+            w1 = ((ab_t - ab_0) / denom1).clamp(0.0, 1.0) #[B, T]
+            seg1 = r_f.unsqueeze(-1) * (1 - w1) + r_a.unsqueeze(-1) * w1  #[B, T]
 
-            # Segment 2: blend r_anchor → r_final over [ab_anc, ab_T]
-            denom2 = (ab_T - ab_anc).clamp(min=1e-6)               # [B, 1]
-            w2     = ((ab_t - ab_anc) / denom2).clamp(0.0, 1.0)    # [B, T]
-            seg2   = r_a.unsqueeze(-1) * (1 - w2) + r_l.unsqueeze(-1) * w2  # [B, T]
+            denom2 = (ab_T - ab_anc).clamp(min=1e-6) #[B, 1]
+            w2 = ((ab_t - ab_anc) / denom2).clamp(0.0, 1.0) #[B, T]
+            seg2 = r_a.unsqueeze(-1) * (1 - w2) + r_l.unsqueeze(-1) * w2  #[B, T]
 
-            # Select segment: t <= anchor → seg1, t > anchor → seg2
-            t_idx = torch.arange(T, device=self.device).unsqueeze(0)  # [1, T]
-            mask  = t_idx <= anc_steps.unsqueeze(-1)                   # [B, T]
-            ri    = torch.where(mask, seg1, seg2)                      # [B, T]
+            t_idx = torch.arange(T, device=self.device).unsqueeze(0)  #[1, T]
+            mask  = t_idx <= anc_steps.unsqueeze(-1) #[B, T]
+            ri = torch.where(mask, seg1, seg2) #[B, T]
 
-            # Pin exact values at the three known-reward timesteps
             idx = torch.arange(B, device=self.device)
-            ri[idx, 0]         = r_f
+            ri[idx, 0] = r_f
             ri[idx, anc_steps] = r_a
-            ri[idx, -1]        = r_l
+            ri[idx, -1] = r_l
             return ri
 
         ri_list = [
-            interp_rewards(rewards_stack[g], rollout['anchor_steps'][g])
+            interp_rewards(rewards_aug[g], rollout['anchor_steps'][g])
             for g in range(G)
         ]
-        ri = torch.stack(ri_list)   # [G, B, T]
+        ri = torch.stack(ri_list) #[G, B, T]
 
-        # ── Discounted returns ────────────────────────────────────────────────
-        gw  = self.gamma_weights[:T]
+        gw = self.gamma_weights[:T]
         ret = torch.flip(
             torch.cumsum(torch.flip(ri * gw, [2]), dim=2), [2]
-        ) / gw                      # [G, B, T]
+        ) / gw #[G, B, T]
 
-        # ── Rank-based advantages normalised to [-1, 1] ───────────────────────
         ranks = ret.argsort(dim=0).argsort(dim=0).float()
-        adv   = (ranks / max(G - 1, 1)) * 2.0 - 1.0   # [G, B, T]
+        adv   = (ranks / max(G - 1, 1)) * 2.0 - 1.0   #[G, B, T]
 
-        # ── Win-rate and confidence (on final-step returns) ───────────────────
-        ret_f    = ret[:, :, -1]                                     # [G, B]
-        ret_f_i  = ret_f.unsqueeze(1)                                # [G, 1, B]
-        ret_f_j  = ret_f.unsqueeze(0)                                # [1, G, B]
-        tau      = ret_f.std(dim=0, keepdim=True).clamp(min=1e-3)   # [1, B]
+        ret_f = ret[:, :, -1]  #[G, B]
+        ret_f_i = ret_f.unsqueeze(1) #[G, 1, B]
+        ret_f_j = ret_f.unsqueeze(0)  #[1, G, B]
+        tau = ret_f.std(dim=0, keepdim=True).clamp(min=1e-3)   #[1, B]
         win_rate = torch.sigmoid(
             (ret_f_i - ret_f_j) / tau.unsqueeze(0)
-        ).mean(dim=-1)                                               # [G, G]
-        confidence = (win_rate - 0.5).abs() * 2.0                   # [G, G]
+        ).mean(dim=-1) #[G, G]
+        confidence = (win_rate - 0.5).abs() * 2.0  #[G, G]
 
-        adv_g    = adv.permute(1, 0, 2)                             # [B, G, T]
-        adv_diff = adv_g.unsqueeze(2) - adv_g.unsqueeze(1)         # [B, G, G, T]
+        adv_g    = adv.permute(1, 0, 2) #[B, G, T]
+        adv_diff = adv_g.unsqueeze(2) - adv_g.unsqueeze(1) #[B, G, G, T]
 
         return dict(
-            rewards_stack = rewards_stack,   # [G, 3, B]
-            sub_final     = sub_final,       # [G, B, 4] — for logging
-            ret           = ret,             # [G, B, T]
-            adv           = adv,             # [G, B, T]
-            adv_diff      = adv_diff,        # [B, G, G, T]
-            win_rate      = win_rate,        # [G, G]
-            confidence    = confidence,      # [G, G]
+            rewards_stack = rewards_stack,  #[G, 3, B]  
+            sub_final = sub_final,  #[G, B, 4]  
+            div_last = div_last, #[G, B]     
+            nov_last = nov_last, #[G, B]     
+            ret = ret, #[G, B, T]
+            adv = adv, #[G, B, T]
+            adv_diff = adv_diff, #[B, G, G, T]
+            win_rate = win_rate, #[G, G]
+            confidence = confidence, #[G, G]
         )
 
-    # ── Log-prob recomputation ────────────────────────────────────────────────
 
     def _recompute_log_probs(
         self,
-        coords_cur  : torch.Tensor,   # [GB, T, N, 3]
+        coords_cur  : torch.Tensor, #[GB, T, N, 3]
         atoms_cur   : torch.Tensor,
         coords_next : torch.Tensor,
         atoms_next  : torch.Tensor,
-        timesteps   : torch.Tensor,   # [GB, T]
+        timesteps   : torch.Tensor, #[GB, T]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass + DDIM step to get log-probs under the *current* policy.
@@ -345,90 +311,79 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             self.scheduler, types_pred, timesteps, atoms_cur,
             eta=self.eta, x_prev=atoms_next, t_batched=True,
         )
-        return lp_coord, lp_types   # both [GB, T]
-
-    # ── SDPO loss ─────────────────────────────────────────────────────────────
+        return lp_coord, lp_types #both [GB, T]
 
     def _sdpo_loss(
         self,
-        lp_coord_new : torch.Tensor,   # [B, G, T]
+        lp_coord_new : torch.Tensor, #[B, G, T]
         lp_types_new : torch.Tensor,
         lp_coord_old : torch.Tensor,
         lp_types_old : torch.Tensor,
-        adv_diff     : torch.Tensor,   # [B, G, G, T]
-        confidence   : torch.Tensor,   # [G, G]
+        adv_diff     : torch.Tensor, #[B, G, G, T]
+        confidence   : torch.Tensor, #[G, G]
+        ret          : torch.Tensor, #[G, B, T]
         T            : int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         log_ratio = (lp_coord_new - lp_coord_old) + \
-                    (lp_types_new - lp_types_old)           # [B, G, T]
+                    (lp_types_new - lp_types_old) #[B, G, T]
 
-        # Pairwise log-ratio difference — never across batch items
-        log_diff = log_ratio.unsqueeze(2) - log_ratio.unsqueeze(1)   # [B, G, G, T]
+        log_diff = log_ratio.unsqueeze(2) - log_ratio.unsqueeze(1) #[B, G, G, T]
 
-        # λ time-decay + log_scale: [1, 1, 1, T] broadcasts over [B, G, G, T]
         lam_t = (self.lam_t[:T] * self.args.log_scale).reshape(1, 1, 1, T)
-        weighted_log_diff = lam_t * log_diff                          # [B, G, G, T]
+        weighted_log_diff = lam_t * log_diff #[B, G, G, T]
 
-        # KL penalty to prevent mode collapse (Schulman et al. approximation)
-        kl_penalty = (log_ratio.exp() - 1 - log_ratio).mean()
+        ret_bg = ret.permute(1, 0, 2) #[B, G, T]
+        ret_std = ret_bg.std(dim=1, keepdim=True).clamp(min=1e-6)  #[B, 1, T]
+        ret_i = ret_bg.unsqueeze(2) #[B, G, 1, T]
+        ret_j = ret_bg.unsqueeze(1) #[B, 1, G, T]
+        ret_gap = ((ret_i - ret_j).abs() / ret_std.unsqueeze(2)
+                     ).clamp(0.0, 3.0) #[B, G, G, T]
+        target = adv_diff * ret_gap #[B, G, G, T]
 
-        # Entropy bonus to encourage exploration (fixed coefficient 0.01)
-        entropy_bonus = 0.01 * (
-            -lp_coord_new.mean() + -lp_types_new.mean()
-        )
+        log_ratio_clipped = log_ratio.clamp(-20.0, 20.0)
+        kl_penalty = (log_ratio_clipped.exp() - 1 - log_ratio).mean()
 
-        # Confidence-weighted SDPO objective: penalise deviation from adv_diff
-        # conf_w near 0 for tied pairs (no signal) → 1 for clear winners/losers
-        conf_w = confidence.unsqueeze(0).unsqueeze(-1)                # [1, G, G, 1]
-        loss = (conf_w * torch.square(weighted_log_diff - adv_diff)).mean() \
+        entropy_bonus = 0.01 * (-lp_coord_new.mean() + -lp_types_new.mean())
+
+        conf_w = confidence.unsqueeze(0).unsqueeze(-1) #[1, G, G, 1]
+        loss = (conf_w * torch.square(weighted_log_diff - target)).mean() \
              + self.args.kl_beta * kl_penalty \
              - entropy_bonus
 
         return loss, weighted_log_diff
-
-    # ── Training step (orchestrates the four phases) ──────────────────────────
 
     def training_step(self, batch, batch_idx):
         opt = self.optimizers()
         B   = self.args.batch_size
         G   = self.N_TRAJECTORIES
 
-        # ── Phase 1: Rollout (no grad) ────────────────────────────────────────
         rollout = self._rollout(B)
         T       = rollout['lp_coord_old'].shape[2]
 
-        # ── Phase 2: Compute advantages (no grad) ────────────────────────────
         adv_data = self._compute_advantages(rollout, T)
 
-        # Log top-level reward early so checkpoint monitoring works even if
-        # training diverges before the end of the step.
         self.log('Reward0_mean', adv_data['rewards_stack'][:, 2].mean())
 
-        # ── Flatten [G, B, T+1, N, D] → [GB, T+1, N, D] for batched forward ─
-        # Permute from [G, T+1, B, N, D] to [G, B, T+1, N, D] first.
-        coords = rollout['coords'].permute(0, 2, 1, 3, 4)    # [G, B, T+1, N, 3]
-        atoms  = rollout['atoms'].permute(0, 2, 1, 3, 4)     # [G, B, T+1, N, A]
+        #Flatten [G, B, T+1, N, D] to [GB, T+1, N, D] for batched forward 
+        #Permute from [G, T+1, B, N, D] to [G, B, T+1, N, D] first.
+        coords = rollout['coords'].permute(0, 2, 1, 3, 4) #[G, B, T+1, N, 3]
+        atoms = rollout['atoms'].permute(0, 2, 1, 3, 4) #[G, B, T+1, N, A]
 
         coords_flat = coords.reshape(G * B, T + 1, -1, 3)
-        atoms_flat  = atoms.reshape(G * B, T + 1, -1, atoms.shape[-1])
+        atoms_flat = atoms.reshape(G * B, T + 1, -1, atoms.shape[-1])
 
-        coords_cur  = coords_flat[:, :-1]   # [GB, T, N, 3]
-        atoms_cur   = atoms_flat[:, :-1]
+        coords_cur = coords_flat[:, :-1] #[GB, T, N, 3]
+        atoms_cur = atoms_flat[:, :-1]
         coords_next = coords_flat[:, 1:]
-        atoms_next  = atoms_flat[:, 1:]
+        atoms_next = atoms_flat[:, 1:]
 
-        # Build timestep tensor from scheduler directly; expand to [GB, T].
-        # Using the tensor's own first dimension rather than args.batch_size avoids
-        # shape mismatches if the dataloader ever produces a partial batch.
         timesteps_GBT = self.scheduler.timesteps \
                             .unsqueeze(0) \
-                            .expand(coords_flat.shape[0], -1)   # [GB, T]
+                            .expand(coords_flat.shape[0], -1) #[GB, T]
 
-        # Old log-probs: [G, B, T] → [B, G, T]
         lp_coord_old_g = rollout['lp_coord_old'].permute(1, 0, 2)
         lp_types_old_g = rollout['lp_types_old'].permute(1, 0, 2)
 
-        # ── Phase 3: Inner update loop ────────────────────────────────────────
         self.model.train()
         weighted_log_diff_last = None
 
@@ -437,9 +392,8 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
 
             lp_coord_new, lp_types_new = self._recompute_log_probs(
                 coords_cur, atoms_cur, coords_next, atoms_next, timesteps_GBT,
-            )   # both [GB, T]
+            ) #[GB, T]
 
-            # Reshape back to [B, G, T] for the SDPO loss
             lp_coord_new_g = lp_coord_new.reshape(G, B, T).permute(1, 0, 2)
             lp_types_new_g = lp_types_new.reshape(G, B, T).permute(1, 0, 2)
 
@@ -448,6 +402,7 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
                 lp_coord_old_g, lp_types_old_g,
                 adv_data['adv_diff'],
                 adv_data['confidence'],
+                adv_data['ret'],
                 T,
             )
 
@@ -455,7 +410,6 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
             opt.step()
 
-        # ── Phase 4: Logging ──────────────────────────────────────────────────
         self._log_metrics(
             loss, lp_coord_new_g, lp_types_new_g,
             lp_coord_old_g, lp_types_old_g,
@@ -463,48 +417,43 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             adv_data, G, T,
         )
 
-    # ── Logging ───────────────────────────────────────────────────────────────
-
     @torch.no_grad()
     def _log_metrics(
         self,
         loss_sdpo    : torch.Tensor,
-        lp_coord_new : torch.Tensor,   # [B, G, T]
+        lp_coord_new : torch.Tensor,  #[B, G, T]
         lp_types_new : torch.Tensor,
         lp_coord_old : torch.Tensor,
         lp_types_old : torch.Tensor,
-        weighted_log_diff : torch.Tensor,   # [B, G, G, T]
+        weighted_log_diff : torch.Tensor,#[B, G, G, T]
         adv_data : dict,
         G : int,
         T : int,
     ) -> None:
         rewards_stack = adv_data['rewards_stack']
-        adv           = adv_data['adv']
-        adv_diff      = adv_data['adv_diff']
-        win_rate      = adv_data['win_rate']
-        confidence    = adv_data['confidence']
+        adv = adv_data['adv']
+        adv_diff = adv_data['adv_diff']
+        win_rate = adv_data['win_rate']
+        confidence = adv_data['confidence']
 
         log_ratio = (lp_coord_new - lp_coord_old) + (lp_types_new - lp_types_old)
         approx_kl = (log_ratio.exp() - 1 - log_ratio).mean()
 
-        r_start  = rewards_stack[:, 0].mean()
+        r_start = rewards_stack[:, 0].mean()
         r_anchor = rewards_stack[:, 1].mean()
-        r_last   = rewards_stack[:, 2].mean()
-        r_std    = rewards_stack[:, 2].std()
+        r_last = rewards_stack[:, 2].mean()
+        r_std = rewards_stack[:, 2].std()
 
-        # Exclude the trivial diagonal (a trajectory vs. itself = 0.5 always)
         diag_mask = ~torch.eye(G, dtype=torch.bool, device=self.device)
-        wr_off    = win_rate[diag_mask]
+        wr_off = win_rate[diag_mask]
         conf_mean = confidence[diag_mask].mean()
 
-        # Alignment: correlation between weighted log-diff and advantage diff
-        wld_off = weighted_log_diff[:, diag_mask, :]   # [B, G*(G-1), T]
+        wld_off = weighted_log_diff[:, diag_mask, :]   #[B, G*(G-1), T]
         adv_off = adv_diff[:, diag_mask, :]
         corr = torch.corrcoef(
             torch.stack([wld_off.flatten(), adv_off.flatten()])
         )[0, 1]
 
-        # Per-timestep alignment split into early / mid / late thirds
         third = max(T // 3, 1)
         corr_per_t = []
         for t_i in range(T):
@@ -534,6 +483,9 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
             "reward/last"                  : r_last,
             "reward/last_std"              : r_std,
             "reward/progression"           : r_last - r_start,
+            "reward/diversity_mean"        : adv_data['div_last'].mean(),
+            "reward/novelty_mean"          : adv_data['nov_last'].mean(),
+            "reward/novelty_rate"          : (adv_data['nov_last'] > 0).float().mean(),
             "loss/sdpo"                    : loss_sdpo,
             "policy/approx_kl"             : approx_kl,
             "policy/log_ratio_mean"        : weighted_log_diff.mean(),
@@ -564,8 +516,6 @@ class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
                   f"mid={corr_mid:.4f}  late={corr_late:.4f}")
             print(f"  grad_norm {grad_norm:.4f}")
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
     torch.set_float32_matmul_precision('medium')
@@ -603,8 +553,6 @@ def train(args: argparse.Namespace) -> None:
     )
     ABSORB_IDX = len(vocab_enc2atom)
 
-    # Load pretrained weights, stripping the 'model.' prefix added by Lightning.
-    # The original code used a brittle string-index trick; this is explicit.
     raw_ckpt   = torch.load('ckpt/Pretrain.ckpt')['state_dict']
     state_dict = {
         k[len('model._orig_mod.'):]: v
@@ -623,18 +571,14 @@ def train(args: argparse.Namespace) -> None:
     )
     tabasco.load_state_dict(state_dict)
 
-    # Freeze everything except the output heads
-    #_TRAINABLE = ('coord_head.', 'type_head.')
-    #for name, param in tabasco.named_parameters():
-    #    param.requires_grad_(any(name.startswith(k) for k in _TRAINABLE))
+    _TRAINABLE = ('crossCoordAtom.', 'crossAtomCoord.', 'coord_head.', 'type_head.')
+    for name, param in tabasco.named_parameters():
+        param.requires_grad_(any(name.startswith(k) for k in _TRAINABLE))
 
-    weighter = AdaptiveWeighter()
     rewarder = MoleculeRewarder(vocab_enc2atom)
-    model    = LightningTabascoPipe(tabasco, rewarder, weighter, args, ABSORB_IDX, vocab_enc2atom, smiles)
+    weighter = AdaptiveWeighter()
+    model = LightningTabascoPipe(tabasco, rewarder, weighter, args, ABSORB_IDX, vocab_enc2atom, smiles)
 
-    # torch.compile is applied AFTER Lightning wraps the model.
-    # Compiling before wrapping interferes with Lightning's .train()/.eval()
-    # hook management and can silently break gradient tracking.
     model.model = torch.compile(model.model)
 
     trainer.fit(model=model, datamodule=RLDataModule())
@@ -645,12 +589,12 @@ if __name__ == '__main__':
     parser.add_argument('--dataset',      default='qm9')
     parser.add_argument('--data-root',    default='data/QM9')
     parser.add_argument('--max_steps',    type=int,   default=200_000)
-    parser.add_argument('--inner_epochs', type=int,   default=3)
+    parser.add_argument('--inner_epochs', type=int,   default=1)
     parser.add_argument('--batch-size',   type=int,   default=8)
     parser.add_argument('--lr',           type=float, default=1e-4)
-    parser.add_argument('--log_scale',    type=float, default=8.0,
+    parser.add_argument('--log_scale',    type=float, default=4.0,
                         help='Scales weighted_log_diff to match adv_diff range.')
-    parser.add_argument('--kl_beta',      type=float, default=0.01,
+    parser.add_argument('--kl_beta',      type=float, default=0.05,
                         help='KL penalty weight. Increase to 0.05–0.1 if collapse occurs.')
     parser.add_argument('--gamma',        type=float, default=0.99)
     parser.add_argument('--lam',          type=float, default=0.95)
@@ -660,6 +604,17 @@ if __name__ == '__main__':
     parser.add_argument('--n-layers',     type=int,   default=6)
     parser.add_argument('--ckpt-dir',     type=str,   default='logs/TrainingSDPO/ckpts')
     parser.add_argument('--sample-steps', type=int,   default=25)
+    parser.add_argument('--diversity-weight', type=float, default=0.3,
+                        help='Weight for intra-batch diversity bonus. '
+                             '0 = disabled. Start at 0.3; raise to 0.5 if '
+                             'uniqueness stays below 0.1 after 200 steps.')
+    parser.add_argument('--novelty-weight',   type=float, default=0.2,
+                        help='Weight for novelty buffer bonus (1.0 = new molecule). '
+                             '0 = disabled. Raise to 0.3 if reward/novelty_rate '
+                             'drops below 0.3 at steady state.')
+    parser.add_argument('--novelty-buf-size', type=int,   default=5_000,
+                        help='Unique SMILES retained in the novelty buffer. '
+                             'Covers ~13 rollout steps at G=32, B=12 before eviction.')
     parser.add_argument('--debug',        action='store_true')
     args = parser.parse_args()
     os.makedirs(args.ckpt_dir, exist_ok=True)

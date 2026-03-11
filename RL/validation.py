@@ -1,47 +1,3 @@
-"""
-validation.py
-
-Validation loop for SDPO molecule generation.
-
-Metrics computed
-----------------
-validity        fraction of generated molecules that RDKit can sanitize
-uniqueness      fraction of valid molecules that are structurally unique
-novelty         fraction of unique molecules not in the training set
-diversity       1 - mean pairwise Tanimoto (Morgan r=2) over unique mols
-qed             mean QED over unique valid molecules
-sa_score        mean SA score (1=easy, 10=hard) over unique valid molecules
-mol_weight      mean molecular weight over unique valid molecules
-
-Early-stopping metric
----------------------
-stopping_score = validity × uniqueness × (0.50·qed + 0.30·sa_norm + 0.20·novelty)
-
-  - validity × uniqueness acts as a hard gate: if either collapses to 0
-    (mode collapse or structural invalidity), the score goes to 0 immediately.
-  - The weighted term rewards chemical quality among molecules that are both
-    valid and unique. Weights reflect your priority ranking:
-        QED      0.50  (drug-likeness)
-        SA_norm  0.30  (synthesizability, inverted+normalised to [0,1])
-        Novelty  0.20  (not in training set)
-
-Lightning early stopping config
---------------------------------
-    EarlyStopping(
-        monitor   = 'val/stopping_score',
-        mode      = 'max',
-        patience  = 20,        # validation epochs, not steps
-        min_delta = 0.001,
-    )
-
-Bond inference strategy
------------------------
-`build_mol_from_coords` tries RDKit DetermineBonds first (no subprocess, fast).
-If RDKit fails or produces an unsanitizable molecule, it falls back to an
-OpenBabel subprocess.  The first approach that yields a sanitizable mol wins.
-`build_rdkit_mol` from RL.reward is reused directly — no duplication.
-"""
-
 from __future__ import annotations
 
 import os
@@ -60,7 +16,7 @@ from rdkit.Chem import AllChem, QED, Descriptors
 from rdkit.DataStructs import BulkTanimotoSimilarity
 
 from RL.SDPO import pipeline_with_logprob
-from RL.reward import build_rdkit_mol, decode_atom_types   # reuse, no duplication
+from RL.reward import build_rdkit_mol, decode_atom_types   #reuse, no duplication
 
 try:
     from rdkit.Contrib.SA_Score import sascorer as _sascorer
@@ -78,25 +34,18 @@ try:
 except ImportError:
     _HAS_OB = False
 
-# Use 'spawn' to avoid CUDA + fork deadlocks in subprocess workers.
 _MP_CTX = mp.get_context('spawn')
 
 
-# ── Stopping score weights ────────────────────────────────────────────────────
-# Matches priority ranking: Uniqueness > Validity > QED > SA > Novelty.
-# Uniqueness and validity are the gate (multiplicative); the rest are weighted.
 _W_QED     = 0.50
 _W_SA      = 0.30
 _W_NOVELTY = 0.20
 
 
-# ── Bond inference ────────────────────────────────────────────────────────────
-
 def _try_rdkit(coords: torch.Tensor, elems: List[str]) -> Optional[Chem.Mol]:
     """
     Attempt bond inference via RDKit DetermineBonds.
     Returns a sanitized Mol or None.
-    Reuses build_rdkit_mol from reward.py — single implementation.
     """
     return build_rdkit_mol(coords, elems)
 
@@ -131,7 +80,6 @@ def _ob_worker(args) -> Optional[str]:
         if rdmol is None:
             return None
 
-        # Reconstruct a clean RWMol so we don't carry OB-specific properties
         rw = Chem.RWMol()
         for atom in rdmol.GetAtoms():
             rw.AddAtom(Chem.Atom(atom.GetSymbol()))
@@ -174,18 +122,14 @@ def _try_openbabel(
 
 
 def build_mol_from_coords(
-    coords     : torch.Tensor,   # [N, 3]
-    atom_types : torch.Tensor,   # [N, A]  one-hot / logit
+    coords     : torch.Tensor,   #[N, 3]
+    atom_types : torch.Tensor,   #[N, A]
     vocab      : Dict[int, str],
     ob_timeout : float = 3.0,
 ) -> Optional[Chem.Mol]:
     """
     Build an RDKit Mol from 3D coordinates and atom-type tensor.
 
-    Strategy: RDKit DetermineBonds first (fast, no subprocess).
-    If RDKit fails or produces an unsanitizable molecule, fall back to
-    OpenBabel (more permissive valence rules, but heavier).
-    Returns the first approach that yields a sanitizable mol, or None.
     """
     elems = decode_atom_types(atom_types, vocab)
 
@@ -193,7 +137,6 @@ def build_mol_from_coords(
     if mol is not None:
         return mol
 
-    # RDKit failed — try OpenBabel
     xyz = coords.cpu().float().tolist()
     return _try_openbabel(elems, xyz, ob_timeout)
 
@@ -202,13 +145,12 @@ def _build_mol_worker(args) -> Optional[str]:
     """
     Top-level pool worker for batch mol building.
     Returns MolBlock string (serialisable across processes) or None.
-    Tries RDKit first, OpenBabel second, exactly as build_mol_from_coords does.
     """
     elems, xyz_list = args
     if not elems or len(elems) < 2:
         return None
 
-    # ── RDKit attempt ─────────────────────────────────────────────────────────
+    #── RDKit attempt ─────────────────────────────────────────────────────────
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
@@ -225,24 +167,18 @@ def _build_mol_worker(args) -> Optional[str]:
     except Exception:
         pass
 
-    # ── OpenBabel fallback ────────────────────────────────────────────────────
     return _ob_worker((elems, xyz_list))
 
 
 def build_mols_batch(
-    coords_list    : List[torch.Tensor],   # list of [N, 3]
-    atom_types_list: List[torch.Tensor],   # list of [N, A]
+    coords_list    : List[torch.Tensor],   #list of [N, 3]
+    atom_types_list: List[torch.Tensor],   #list of [N, A]
     vocab          : Dict[int, str],
     n_workers      : int   = 0,
     wall_timeout   : float = 30.0,
 ) -> Tuple[List[Optional[Chem.Mol]], int]:
     """
     Build RDKit mols for a whole batch in parallel.
-
-    Uses a single shared pool to avoid per-molecule spawn overhead.
-    A single wall-clock deadline covers the entire batch — avoids the
-    original per-future timeout that could accumulate to n_mols × timeout
-    in the worst case.
 
     Returns (mols, n_timeouts).
     """
@@ -279,13 +215,12 @@ def build_mols_batch(
             except Exception:
                 pass
 
-        pool.terminate()   # cancel any still-running workers
+        pool.terminate()
         pool.join()
 
     return results, n_timeouts
 
 
-# ── SMILES utilities ──────────────────────────────────────────────────────────
 
 def _to_smiles(mol: Optional[Chem.Mol]) -> Optional[str]:
     if mol is None:
@@ -297,7 +232,6 @@ def _to_smiles(mol: Optional[Chem.Mol]) -> Optional[str]:
         return None
 
 
-# ── Per-molecule property computation ────────────────────────────────────────
 
 def _safe_qed(mol: Chem.Mol) -> float:
     try:
@@ -320,8 +254,6 @@ def _sa_to_norm(sa: float) -> float:
     return max(0.0, min(1.0, 1.0 - (sa - 1.0) / 9.0))
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
-
 def compute_metrics(
     mols         : List[Optional[Chem.Mol]],
     train_smiles : set,
@@ -330,17 +262,14 @@ def compute_metrics(
     Compute all validation metrics from a list of RDKit mols.
 
     Returns (metrics_dict, unique_smiles, unique_mols).
-    unique_* are deduplicated valid molecules, useful for SDF export.
     """
     n_total = len(mols)
 
-    # ── Validity ──────────────────────────────────────────────────────────────
     smiles_map = [(m, _to_smiles(m)) for m in mols]
     valid_pairs = [(m, s) for m, s in smiles_map if s is not None]
     n_valid     = len(valid_pairs)
     validity    = n_valid / n_total if n_total > 0 else 0.0
 
-    # ── Uniqueness ────────────────────────────────────────────────────────────
     seen: Dict[str, Chem.Mol] = {}
     for m, s in valid_pairs:
         if s not in seen:
@@ -350,14 +279,11 @@ def compute_metrics(
     n_unique      = len(unique_smiles)
     uniqueness    = n_unique / n_valid if n_valid > 0 else 0.0
 
-    # ── Novelty ───────────────────────────────────────────────────────────────
     n_novel = sum(1 for s in unique_smiles if s not in train_smiles)
     novelty = n_novel / n_unique if n_unique > 0 else 0.0
 
-    # ── Diversity ─────────────────────────────────────────────────────────────
     diversity = _compute_diversity(unique_mols)
 
-    # ── Chemical properties ───────────────────────────────────────────────────
     qed_scores = [_safe_qed(m)   for m in unique_mols]
     sa_scores  = [_safe_sa(m)    for m in unique_mols]
     mw_scores  = [Descriptors.MolWt(m) for m in unique_mols]
@@ -365,34 +291,27 @@ def compute_metrics(
     mean_qed = float(np.mean(qed_scores)) if qed_scores else 0.0
     mean_sa  = float(np.mean([s for s in sa_scores if s is not None])) if any(
         s is not None for s in sa_scores
-    ) else 5.0   # neutral fallback
+    ) else 5.0   #neutral fallback
     mean_mw  = float(np.mean(mw_scores))  if mw_scores  else 0.0
 
     sa_norm = _sa_to_norm(mean_sa)
 
-    # ── Stopping score ────────────────────────────────────────────────────────
-    # Gate:    validity × uniqueness  → 0 if either collapses
-    # Weights: QED(0.50) + SA_norm(0.30) + novelty(0.20)
     gate    = validity * uniqueness
     quality = _W_QED * mean_qed + _W_SA * sa_norm + _W_NOVELTY * novelty
     stopping_score = gate * quality
 
     metrics = {
-        # Production-level
         'validity'       : validity,
         'uniqueness'     : uniqueness,
         'novelty'        : novelty,
         'n_valid'        : n_valid,
         'n_unique'       : n_unique,
-        # Chemical quality
         'qed'            : mean_qed,
         'sa_score'       : mean_sa,
         'sa_norm'        : sa_norm,
         'mol_weight'     : mean_mw,
         'diversity'      : diversity,
-        # Composite
         'stopping_score' : stopping_score,
-        # Diagnostic sub-scores
         'gate'           : gate,
         'quality'        : quality,
     }
@@ -418,7 +337,7 @@ def _compute_diversity(mols: List[Chem.Mol], max_mols: int = 1000) -> float:
     return 1.0 - (sim_sum / count) if count > 0 else 0.0
 
 
-# ── Sampling ──────────────────────────────────────────────────────────────────
+#── Sampling ──────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def sample_molecules(
@@ -436,13 +355,6 @@ def sample_molecules(
     """
     Generate n_samples molecules and return their coords and atom types.
 
-    Uses x̂₀_pred_last — the model's final predicted clean molecule — rather
-    than the raw last denoising state.  x̂₀_pred_last is already fully decoded
-    and clean, which is what we want to evaluate during validation.
-
-    atom_dim is inferred from vocab rather than hard-coded so it stays
-    consistent with whatever vocabulary the model was built with.
-
     Returns
     -------
     coords_list    : list of n_samples tensors [N, 3]
@@ -459,7 +371,6 @@ def sample_molecules(
         x     = torch.randn(B, n_atoms, 3,        device=device)
         types = torch.randn(B, n_atoms, atom_dim,  device=device)
 
-        # x0_pred_last: [B, N, D]  — the new pipeline return
         _, _, _, _, _, _, x0_pred_last, _, _ = pipeline_with_logprob(
             model, x, types,
             scheduler           = scheduler,
@@ -469,17 +380,14 @@ def sample_molecules(
             eta                 = eta,
         )
 
-        coords_b    = x0_pred_last[:, :, :coord_dim]         # [B, N, 3]
-        atom_types_b = x0_pred_last[:, :, coord_dim:]        # [B, N, A]
+        coords_b    = x0_pred_last[:, :, :coord_dim]         #[B, N, 3]
+        atom_types_b = x0_pred_last[:, :, coord_dim:]        #[B, N, A]
 
         for b in range(B):
             all_coords.append(coords_b[b])
             all_atom_types.append(atom_types_b[b])
 
     return all_coords, all_atom_types
-
-
-# ── Full evaluation ───────────────────────────────────────────────────────────
 
 def evaluate(
     model,
@@ -498,7 +406,6 @@ def evaluate(
     Full evaluation pass: sample → build mols → compute metrics.
 
     Returns (metrics, unique_mols, unique_smiles).
-    unique_* are available for SDF export if needed.
     """
     coords_list, atom_types_list = sample_molecules(
         model, scheduler, vocab, device,
@@ -521,9 +428,6 @@ def evaluate(
     metrics['n_timeouts'] = n_timeouts
 
     return metrics, unique_mols, unique_smiles
-
-
-# ── SDF export ────────────────────────────────────────────────────────────────
 
 def write_sdf(
     mols         : List[Chem.Mol],
@@ -567,14 +471,9 @@ def write_sdf(
     return n_written
 
 
-# ── Lightning mixin ───────────────────────────────────────────────────────────
-
 class ValidationMixin:
     """
     Mix into LightningTabascoPipe to add structured validation and early stopping.
-
-        class LightningTabascoPipe(ValidationMixin, pl.LightningModule):
-            ...
 
     Optional attributes on the host class
     --------------------------------------
@@ -585,7 +484,7 @@ class ValidationMixin:
     """
 
     def validation_step(self, batch, batch_idx):
-        pass   # data is generated inside on_validation_epoch_end
+        pass 
 
     def on_validation_epoch_end(self):
         n_samples    = getattr(self, 'val_n_samples', 256)
@@ -605,7 +504,6 @@ class ValidationMixin:
             batch_size   = 32,
         )
 
-        # Log all float metrics; highlight stopping_score in the progress bar
         for k, v in metrics.items():
             if isinstance(v, float):
                 self.log(
@@ -614,7 +512,6 @@ class ValidationMixin:
                     sync_dist = True,
                 )
 
-        # Optional SDF export — useful for qualitative inspection
         if write_sdf_ and unique_mols:
             os.makedirs(sdf_dir, exist_ok=True)
             path = os.path.join(

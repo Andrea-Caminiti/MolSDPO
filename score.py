@@ -319,9 +319,9 @@ def load_checkpoint(ckpt_path: str, args: argparse.Namespace, absorb_idx: int) -
     """
     raw       = torch.load(ckpt_path, map_location='cpu')['state_dict']
     state_dict = {
-        k[len('model.'):]: v
+        k[len('model._orig_mod.'):]: v
         for k, v in raw.items()
-        if k.startswith('model.')
+        if k.startswith('model._orig_mod.')
     }
 
     model = TabascoV2(
@@ -363,8 +363,7 @@ def main(args: argparse.Namespace) -> None:
     enc2atom   = enc2atom.to(device)
 
     # Build vocab dict {int → element symbol} for validation/reward functions
-    vocab = {i: enc2atom[i].item() if hasattr(enc2atom[i], 'item') else str(enc2atom[i])
-             for i in range(ABSORB_IDX)}
+    vocab = enc2atom
 
     # ── Model + scheduler ─────────────────────────────────────────────────────
     print('[score] loading checkpoint...')
