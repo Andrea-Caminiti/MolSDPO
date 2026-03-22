@@ -169,6 +169,29 @@ def _build_mol_worker(args) -> Optional[str]:
 
     return _ob_worker((elems, xyz_list))
 
+def remove_wildcard_atoms(mol):
+    """Remove wildcard (*) atoms from an RDKit molecule."""
+    if mol is None:
+        return None
+    
+    # Get indices of wildcard atoms (atomic number 0)
+    wildcard_indices = [atom.GetIdx() for atom in mol.GetAtoms() 
+                        if atom.GetAtomicNum() == 0]
+    
+    if not wildcard_indices:
+        return mol  # nothing to do
+    
+    # Remove atoms in reverse order to avoid index shifting
+    edit_mol = Chem.RWMol(mol)
+    for idx in sorted(wildcard_indices, reverse=True):
+        edit_mol.RemoveAtom(idx)
+    
+    # Sanitize the result
+    try:
+        Chem.SanitizeMol(edit_mol)
+        return edit_mol.GetMol()
+    except Exception:
+        return None  # molecule is invalid after removal
 
 def build_mols_batch(
     coords_list    : List[torch.Tensor],   #list of [N, 3]
@@ -207,7 +230,8 @@ def build_mols_batch(
             try:
                 molblock = fut.get(timeout=remaining)
                 if molblock is not None:
-                    results[i] = Chem.MolFromMolBlock(molblock, sanitize=False, removeHs=False)
+                    mol = Chem.MolFromMolBlock(molblock, sanitize=True, removeHs=False)
+                    results[i] = remove_wildcard_atoms(mol)
                 else:
                     results[i] = None
             except mp.TimeoutError:
@@ -281,7 +305,7 @@ def compute_metrics(
 
     n_novel = sum(1 for s in unique_smiles if s not in train_smiles)
     novelty = n_novel / n_unique if n_unique > 0 else 0.0
-
+    
     diversity = _compute_diversity(unique_mols)
 
     qed_scores = [_safe_qed(m)   for m in unique_mols]
@@ -326,7 +350,16 @@ def _compute_diversity(mols: List[Chem.Mol], max_mols: int = 1000) -> float:
         idx  = np.random.choice(len(mols), max_mols, replace=False)
         mols = [mols[i] for i in idx]
 
-    fps     = [AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048) for m in mols]
+    fps     = []
+    valid_mols = []
+    for m in mols:
+        try:
+
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048)) 
+        except Exception:
+            Chem.rdmolops.FastFindRings(m)
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=2048)) 
+
     sim_sum = 0.0
     count   = 0
     for i, fp in enumerate(fps):
@@ -507,7 +540,7 @@ class ValidationMixin:
         for k, v in metrics.items():
             if isinstance(v, float):
                 self.log(
-                    f'val/{k}', v,
+                    f'{k}', v,
                     prog_bar  = (k == 'stopping_score'),
                     sync_dist = True,
                 )

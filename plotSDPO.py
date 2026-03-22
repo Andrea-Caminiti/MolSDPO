@@ -14,9 +14,9 @@ def plot_rl_metrics(df, outpath, composed, switch):
         'reward_stats': ['Reward_gap_start', 'Reward_gap_last'],
         'training_loss_stats': ['Training_loss'],
         'diffs': ['weighted_log_diff', 'advantage_diff'],
-        'mol_quality_metrics': ['val/qed', 'val/sa_score', 'val/mol_weight'],
-        'mol_diversity_metrics': ['val/novelty', 'val/diversity', 'val/uniqueness', 'val/validity'],
-        'stopping_criteria': ['val/stopping_score']
+        'mol_quality_metrics': ['qed', 'sa_score', 'mol_weight'],
+        'mol_diversity_metrics': ['novelty', 'diversity', 'uniqueness', 'validity'],
+        'stopping_criteria': ['stopping_score']
     }
 
     # 1. Standard Plots for grouped metrics

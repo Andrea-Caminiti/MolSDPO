@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import sys
+import time
 import textwrap
 from datetime import datetime
 from pathlib import Path
@@ -372,6 +372,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Generate and evaluate ─────────────────────────────────────────────────
     print(f'[score] generating {args.n_samples} molecules...')
+    start = time.time()
     metrics, unique_mols, unique_smiles = evaluate(
         model        = model,
         scheduler    = scheduler,
@@ -383,7 +384,7 @@ def main(args: argparse.Namespace) -> None:
         eta          = args.eta,
         batch_size   = args.batch_size,
     )
-
+    print(f'Generaterd 1000 molecules in {time.time() - start} s')
     print(
         f'[score] validity={metrics["validity"]:.3f}  '
         f'unique={metrics["uniqueness"]:.3f}  '
@@ -437,8 +438,8 @@ if __name__ == '__main__':
                         help='Max training molecules to use for reference statistics')
     # Model architecture (must match checkpoint)
     parser.add_argument('--d-model',     type=int,   default=384)
-    parser.add_argument('--n-heads',     type=int,   default=8)
-    parser.add_argument('--n-layers',    type=int,   default=6)
+    parser.add_argument('--n-heads',     type=int,   default=12)
+    parser.add_argument('--n-layers',    type=int,   default=24)
     # Sampling
     parser.add_argument('--n-samples',   type=int,   default=1000)
     parser.add_argument('--batch-size',  type=int,   default=32)

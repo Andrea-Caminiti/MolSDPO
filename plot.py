@@ -10,14 +10,14 @@ def plot_training_metrics(csv_path):
     # 2. Define metric groups for better organization
     train_losses = ["com_loss","coord_loss","geom_loss","loss","mag_loss","type_loss"]
     val_denoise = [
-        'val/denoise_loss_t10', 'val/denoise_loss_t100', 
-        'val/denoise_loss_t500', 'val/denoise_loss_t900'
+        'denoise_loss_t10', 'denoise_loss_t100', 
+        'denoise_loss_t500', 'denoise_loss_t900'
     ]
     val_ratios = [
-        'val/valid_ratio', 'val/connected_ratio', 'val/realistic_ratio', 
+        'valid_ratio', 'connected_ratio', 'realistic_ratio', 
     ]
-    val_stats = ['val/mean_atoms', 'val/mean_min_dist_A']
-    val_frags = ['val/mean_number_frags']
+    val_stats = ['mean_atoms', 'mean_min_dist_A']
+    val_frags = ['mean_number_frags']
     # Helper function to plot a group of metrics
     def plot_group(cols, title, ylabel, filename, marker=None):
         plt.figure(figsize=(12, 6))
@@ -54,16 +54,16 @@ def plot_training_metrics(csv_path):
         fig, ax1 = plt.subplots(figsize=(12, 6))
         
         # Plot Mean Atoms on Left Axis
-        d1 = df.dropna(subset=['val/mean_atoms', 'step'])
-        ax1.plot(d1['step'], d1['val/mean_atoms'], color='tab:blue', marker='^', label='Mean Atoms')
+        d1 = df.dropna(subset=['mean_atoms', 'step'])
+        ax1.plot(d1['step'], d1['mean_atoms'], color='tab:blue', marker='^', label='Mean Atoms')
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Mean Atoms', color='tab:blue')
         ax1.tick_params(axis='y', labelcolor='tab:blue')
 
         # Plot Min Dist on Right Axis
         ax2 = ax1.twinx()
-        d2 = df.dropna(subset=['val/mean_min_dist_A', 'step'])
-        ax2.plot(d2['step'], d2['val/mean_min_dist_A'], color='tab:red', marker='d', label='Mean Min Dist (A)')
+        d2 = df.dropna(subset=['mean_min_dist_A', 'step'])
+        ax2.plot(d2['step'], d2['mean_min_dist_A'], color='tab:red', marker='d', label='Mean Min Dist (A)')
         ax2.set_ylabel('Mean Min Dist (A)', color='tab:red')
         ax2.tick_params(axis='y', labelcolor='tab:red')
 

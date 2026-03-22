@@ -134,34 +134,37 @@ def p_losses_joint_absorb_improved_efficient(
     # ── Reconstruct x0 ──────────────────────────────────────────────────────
     x0_pred = (x_t - sqrt_one_minus_alpha * coord_pred) / (sqrt_alpha + 1e-8)
 
-    # ── Distance loss — real atom pairs only ─────────────────────────────────
-    pair_mask = real_mask.unsqueeze(2) & real_mask.unsqueeze(1)
-    triu_base = torch.triu(torch.ones(N, N, device=device, dtype=torch.bool), diagonal=1)
-    triu_mask = pair_mask & triu_base
+    
     true_dists = torch.cdist(coords0, coords0)
     pred_dists = torch.cdist(x0_pred, x0_pred)
-    n_pairs    = triu_mask.sum(dim=(1, 2)).float().clamp(min=1)
-    dist_loss  = (((pred_dists - true_dists) ** 2) * triu_mask).sum(dim=(1, 2)) / n_pairs
+    real_mask = real_mask.float()
+    mask_2d = torch.matmul(real_mask, real_mask.transpose(-1, -2))
+
+    dist_loss = F.mse_loss(pred_dists, true_dists)
+    dist_loss = (dist_loss * mask_2d).mean()
+    # ── Distance loss — real atom pairs only ─────────────────────────────────
+    #pair_mask = real_mask.unsqueeze(2) & real_mask.unsqueeze(1)
+    #triu_base = torch.triu(torch.ones(N, N, device=device, dtype=torch.bool), diagonal=1)
+    #triu_mask = pair_mask & triu_base
+    #n_pairs    = triu_mask.sum(dim=(1, 2)).float().clamp(min=1)
+    #dist_loss  = (((pred_dists - true_dists) ** 2) * triu_mask).sum(dim=(1, 2)) / n_pairs
 
     # ── Centre-of-mass loss — real atoms only ────────────────────────────────
     n_real_3d = n_real.unsqueeze(-1)
     com_true  = (coords0 * real_mask.unsqueeze(-1)).sum(dim=1) / n_real_3d
     com_pred  = (x0_pred * real_mask.unsqueeze(-1)).sum(dim=1) / n_real_3d
     com_loss  = ((com_pred - com_true) ** 2).mean(dim=-1)
-
-    # ── Adaptive weighting by timestep ──────────────────────────────────────
+        
     t_norm    = t_idx.float().to(device) / (scheduler.config.num_train_timesteps - 1)
-    denoise_w = 0.3 + 0.7 * t_norm
-    geom_w    = 1.0 - 0.9 * t_norm
-
+    denoise_w = 0.3 + 0.7 * t_norm     # 0.3 at t=0  → 1.0 at t=T
+    geom_w    = 1.0 - 0.9 * t_norm     # 1.0 at t=0  → 0.1 at t=T
     # ── Total loss ───────────────────────────────────────────────────────────
     loss = (
-        denoise_w * coord_loss
-        + lambda_type * type_loss
+        denoise_w * coord_loss +
+        lambda_type * type_loss
         + lambda_dist * geom_w * dist_loss
         + lambda_com  * com_loss
     )
-
     metrics = {
         'coord_loss': coord_loss.mean().item(),
         'type_loss':  type_loss.mean().item(),

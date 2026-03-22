@@ -530,7 +530,7 @@ def train(args: argparse.Namespace) -> None:
         every_n_train_steps = 100,
     )
     early_stop_cb = EarlyStopping(
-        monitor   = 'val/stopping_score',
+        monitor   = 'stopping_score',
         mode      = 'max',
         patience  = 5,
         min_delta = 0.001,

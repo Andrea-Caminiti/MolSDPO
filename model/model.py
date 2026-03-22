@@ -303,7 +303,7 @@ class TabascoV2(nn.Module):
 class LightningTabasco(pl.LightningModule):
     """Lightning module for training TabascoV2."""
     
-    def __init__(self, args, vocab_enc2atom: torch.Tensor):
+    def __init__(self, args, vocab_enc2atom: torch.Tensor, model_path: str | None = None):
         super().__init__()
         self.save_hyperparameters(args)
         self.args = args
@@ -320,7 +320,15 @@ class LightningTabasco(pl.LightningModule):
             pair_rbf_centers=args.d_model // 2,
             dropout=0.1
         )
-        
+        if model_path: 
+            raw_ckpt   = torch.load(model_path)['state_dict']
+            state_dict = {
+                k[len('model._orig_mod.'):]: v
+                for k, v in raw_ckpt.items()
+                if k.startswith('model._orig_mod.')
+            }
+
+            self.model.load_state_dict(state_dict)
         self.register_buffer("loss_history", torch.ones(args.T) * 1000.0)
         self.register_buffer("sampling_probs", torch.ones(args.T) / args.T)
         self.alpha_ema = 0.01
@@ -443,9 +451,9 @@ class LightningTabasco(pl.LightningModule):
                 )
 
                 self.log(
-                    f"val/denoise_loss_t{t_val}", loss,
+                    f"denoise_loss_t{t_val}", loss,
                     on_step=False, on_epoch=True,
-                    prog_bar=(t_val == 100), sync_dist=True,
+                    prog_bar=(t_val == 10), sync_dist=True,
                 )
 
     def on_validation_epoch_end(self):
@@ -545,16 +553,16 @@ class LightningTabasco(pl.LightningModule):
         denom = max(len(all_atom_counts), 1)
 
         metrics = {
-            "val/valid_ratio":       n_valid     / denom,
-            "val/connected_ratio":   n_connected / denom,
-            "val/realistic_ratio":   n_realistic / denom,
-            "val/mean_atoms":        float(np.mean(all_atom_counts)) if all_atom_counts else 0.0,
-            "val/mean_min_dist_A":   float(np.mean(all_min_dists))   if all_min_dists   else 0.0,
-            "val/mean_number_frags": np.mean(frags).item() if frags else 0.0,
+            "valid_ratio":       n_valid     / denom,
+            "connected_ratio":   n_connected / denom,
+            "realistic_ratio":   n_realistic / denom,
+            "mean_atoms":        float(np.mean(all_atom_counts)) if all_atom_counts else 0.0,
+            "mean_min_dist_A":   float(np.mean(all_min_dists))   if all_min_dists   else 0.0,
+            "mean_number_frags": np.mean(frags).item() if frags else 0.0,
         }
         self.log_dict(metrics, on_epoch=True)
 
         print(
             f"\n── val epoch {self.current_epoch} ──  "
-            + "  ".join(f"{k.split('/')[1]}={v:.3f}" for k, v in metrics.items())
+            + "  ".join(f"{k}={v:.3f}" for k, v in metrics.items())
         )

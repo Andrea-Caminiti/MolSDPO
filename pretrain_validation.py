@@ -92,7 +92,7 @@ class DiffusionValidationCallback(Callback):
         # Log metrics
         for key, value in metrics.items():
             if isinstance(value, (int, float)):
-                pl_module.log(f'val/{key}', value, on_step=True, prog_bar=False)
+                pl_module.log(f'{key}', value, on_step=True, prog_bar=False)
         
     
     def _get_val_batch(self):
@@ -293,19 +293,19 @@ class EarlyStoppingOnValidation(Callback):
         logged_metrics = trainer.callback_metrics
         
         # Check monotonicity
-        if 'val/denoise_monotonic' in logged_metrics:
-            if logged_metrics['val/denoise_monotonic'].item() < 0.5:  # Not monotonic
+        if 'denoise_monotonic' in logged_metrics:
+            if logged_metrics['denoise_monotonic'].item() < 0.5:  # Not monotonic
                 self.bad_count += 1
                 print(f"⚠️  Warning: Denoising not monotonic ({self.bad_count}/{self.patience})")
             else:
                 # Reset if monotonic
-                if 'val/gen_valid_ratio' in logged_metrics:
-                    if logged_metrics['val/gen_valid_ratio'].item() >= self.min_valid_ratio:
+                if 'gen_valid_ratio' in logged_metrics:
+                    if logged_metrics['gen_valid_ratio'].item() >= self.min_valid_ratio:
                         self.bad_count = 0
         
         # Check generation quality
-        if 'val/gen_valid_ratio' in logged_metrics:
-            if logged_metrics['val/gen_valid_ratio'].item() < self.min_valid_ratio:
+        if 'gen_valid_ratio' in logged_metrics:
+            if logged_metrics['gen_valid_ratio'].item() < self.min_valid_ratio:
                 self.bad_count += 1
                 print(f"⚠️  Warning: Low generation quality ({self.bad_count}/{self.patience})")
         
