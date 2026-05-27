@@ -17,7 +17,7 @@ setup(
         "hpsv2",
         "tqdm",
         "rdkit",
-        "openbabel-wheel",
+        "openbabel>=3.2.0",
         "lightning",
         "diffusers",
         "posebusters"
